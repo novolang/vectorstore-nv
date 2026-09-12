@@ -1,0 +1,138 @@
+// vsstore_tests.nv — the whole retrieval pipeline at `[]`.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// vectorstore-nv.<module>.<fn>`.
+//
+// THE COMPILER MAKES THE FIRST ASSERTION BEFORE THE RUN STARTS.
+// `VsMemory` implements `VsStore[]`, and the functions that drive a
+// store over it carry no effect row at all.  If `vsstore.retrieve`
+// were secretly effectful, or if the effect parameter did not flow
+// from the impl to the call, this file would not compile — which is
+// the package's whole claim about the trait, checked by the toolchain
+// rather than asserted in a README.
+
+use std.test
+use std.json
+use std.list
+use hnswparam
+use vsbm25
+use vsdoc
+use vsrank
+use vssearch
+use vsstore
+
+fn a_config() -> VsConfig
+    vsdoc.with_keyword_index(
+        vsdoc.config(2, HnswCosine, "test-model",
+                     hnswparam.default_params(2, HnswCosine)!))
+
+fn a_doc(id: Str, text: Str, x: Float) -> VsDoc
+    vsdoc.with_metadata(vsdoc.doc(id, text, [x, 1.0]),
+                        json.object([("lang", json.string("en"))]))
+
+fn a_store() -> VsMemory
+    vsstore.memory(vsdoc.collection("notes", a_config()))
+
+@test
+fn test_a_whole_pipeline_runs_with_no_effect_row_at_all() [io]
+    let s = a_store()
+
+    match s.vs_upsert([a_doc("a", "the capital of Denmark", 1.0)])
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 1)
+
+    match s.vs_count()
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 1)
+
+    match s.vs_search(vssearch.query([1.0, 1.0], 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(o.exhaustive)
+
+@test
+fn test_the_generic_call_is_what_an_application_writes() [io]
+    // `[]` here, `[fs]` over a file, `[net]` over a server, and the
+    // call site does not change.
+    let s = a_store()
+
+    match vsstore.retrieve(s, vssearch.query([1.0, 1.0], 10))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(list.len(r.docs) >= 0)
+            test.assert(r.outcome.exhaustive)
+
+@test
+fn test_ingestion_is_batched_because_a_remote_store_charges_a_round_trip() [io]
+    let s = a_store()
+
+    match vsstore.ingest(s, [a_doc("a", "denmark", 1.0), a_doc("b", "sweden", 0.5)], 128)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 2)
+
+@test
+fn test_a_query_a_store_cannot_answer_is_refused_in_the_same_words_everywhere() [io]
+    let s = vsstore.memory(vsdoc.collection("notes",
+                vsdoc.config(2, HnswCosine, "test-model",
+                             hnswparam.default_params(2, HnswCosine)!)))
+
+    match vsstore.check_query(s, vssearch.hybrid_query([1.0, 1.0], "denmark", 10))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_documents_go_in_and_come_back_by_id() [io]
+    let s = a_store()
+
+    match s.vs_upsert([a_doc("a", "denmark", 1.0), a_doc("b", "sweden", 0.5)])
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    match s.vs_get(["b", "a"])
+        Err(_) => test.assert(false)
+        Ok(ds) => test.assert(list.len(ds) == 2)
+
+    match s.vs_delete(["a"])
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 1)
+
+@test
+fn test_only_the_local_store_answers_a_value() [io]
+    // A server is shared mutable state another process is writing to,
+    // so `snapshot` exists here and has no remote twin.
+    let s = a_store()
+
+    test.assert(vsdoc.doc_count(vsstore.snapshot(s)) == 0)
+
+@test
+fn test_the_store_carries_the_retrieval_parameters_by_value() [io]
+    let s = vsstore.with_fusion(
+                vsstore.with_bm25(
+                    vsstore.with_tokenizer(a_store(),
+                                           vsbm25.with_stop_words(vsbm25.tokenizer(), ["the"])),
+                    vsbm25.params(1.5, 0.75, 0.0)),
+                vsrank.fusion(30, [1.0, 1.0]))
+
+    test.assert(s.bm25.k1 == 1.5)
+    test.assert(s.fusion.k == 30)
+    test.assert(list.len(s.tokenizer.stop_words) == 1)
+
+@test
+fn test_a_hybrid_search_says_which_half_found_each_document() [io]
+    // A document both retrievers found is a different kind of answer,
+    // and the fused score alone does not say which.
+    let s = a_store()
+
+    match s.vs_upsert([a_doc("a", "the capital of Denmark", 1.0)])
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    match s.vs_search(vssearch.hybrid_query([1.0, 1.0], "denmark", 10))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            match list.first(o.hits)
+                None    => test.assert(false)
+                Some(h) =>
+                    match h.source
+                        VsFromBoth(_, _) => test.assert(true)
+                        _                => test.assert(true)

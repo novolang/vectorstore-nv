@@ -1,0 +1,203 @@
+// vsstore.nv — the trait a local collection and a remote server both
+// sit behind.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `VsStore[e]` IS THE TRAIT THAT CROSSES THE LAYER.  A collection in
+// memory performs nothing; a file performs `[fs]`; a qdrant or chroma
+// server performs `[net]`.  Behind one trait they are the same four
+// calls, and a program that developed against the in-memory store and
+// deployed against a server changes the value it constructs and
+// nothing else.
+//
+// WHAT THE TRAIT DELIBERATELY DOES NOT HIDE.  Three differences are
+// real and a trait that papered over them would make the remote stores
+// look like the local one until they were not:
+//
+//   A REMOTE STORE'S FILTER IS ITS OWN.  `vshttp` translates
+//   `VsFilter` per dialect, and `vsfilter.matches` is the definition
+//   both translations are tested against — but a server's evaluation
+//   of a missing field or a type mismatch is the SERVER's, and where
+//   it differs from this package's, the README's table says so rather
+//   than a wrapper pretending otherwise.
+//
+//   A REMOTE STORE IS NOT A VALUE.  A local collection is immutable
+//   and every call answers a new one; a server is shared mutable state
+//   that another process is writing to.  So `VsStore`'s upsert answers
+//   a store rather than a collection, and `snapshot` — which is what
+//   turns a store back into a value — is only on the local one.
+//
+//   A REMOTE SEARCH CANNOT PROMISE `exhaustive`.  Neither server
+//   reports whether its filtered search was complete, so `vshttp`
+//   answers `exhaustive: false` for every filtered query.  That is a
+//   loss of information, not a bug, and it is stated where a caller
+//   reads it rather than assumed away.
+
+// A document store.
+//
+// `e` is the effect row the implementation supplies: nothing at all
+// for the in-memory store, `[fs]` for the file-backed one, `[net]` for
+// a server.
+pub trait VsStore[e]
+    // Insert or replace documents.  Answers the store, because a
+    // remote one is not a value and cannot answer a collection.
+    fn vs_upsert(self, docs: [VsDoc]) -> Result<Int, VsFault> [e]
+    // Remove documents by id.  Answers how many were there.
+    fn vs_delete(self, ids: [Str]) -> Result<Int, VsFault> [e]
+    // Fetch documents by id, in the order asked for, skipping absent
+    // ones.
+    fn vs_get(self, ids: [Str]) -> Result<[VsDoc], VsFault> [e]
+    // Search.  The outcome carries the plan that ran and whether it
+    // was exhaustive — and a remote store answers false for the second
+    // on any filtered query, because neither server reports it.
+    fn vs_search(self, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [e]
+    // How many live documents.  `-1` when the store cannot say without
+    // a scan, which is what a remote one answers for a filtered count.
+    fn vs_count(self) -> Result<Int, VsFault> [e]
+
+// A store over a collection held in memory.
+//
+// The in-memory store is where a program starts and where its tests
+// stay: it performs nothing, so a whole retrieval pipeline is testable
+// with no server and no file.
+pub struct VsMemory
+    collection: VsCollection
+    tokenizer: VsTokenizer
+    bm25: VsBm25Params
+    fusion: VsFusion
+
+// A store over a collection in memory.
+//
+// ```novo
+// use vsstore
+//
+// fn open(c: VsCollection) -> VsMemory
+//     vsstore.memory(c)
+// ```
+pub fn memory(c: VsCollection) -> VsMemory []
+    todo("vectorstore-nv.vsstore.memory")
+
+// The same store with a tokeniser of the caller's own.
+//
+// ```novo
+// use vsstore
+//
+// fn tuned(m: VsMemory, t: VsTokenizer) -> VsMemory
+//     vsstore.with_tokenizer(m, t)
+// ```
+pub fn with_tokenizer(m: VsMemory, t: VsTokenizer) -> VsMemory []
+    todo("vectorstore-nv.vsstore.with_tokenizer")
+
+// The same store with BM25 parameters of the caller's own.
+//
+// ```novo
+// use vsstore
+//
+// fn tuned(m: VsMemory, p: VsBm25Params) -> VsMemory
+//     vsstore.with_bm25(m, p)
+// ```
+pub fn with_bm25(m: VsMemory, p: VsBm25Params) -> VsMemory []
+    todo("vectorstore-nv.vsstore.with_bm25")
+
+// The same store with a fusion of the caller's own.
+//
+// ```novo
+// use vsstore
+//
+// fn tuned(m: VsMemory, f: VsFusion) -> VsMemory
+//     vsstore.with_fusion(m, f)
+// ```
+pub fn with_fusion(m: VsMemory, f: VsFusion) -> VsMemory []
+    todo("vectorstore-nv.vsstore.with_fusion")
+
+// The collection inside, as a value.
+//
+// **ONLY ON THE LOCAL STORE**, and that asymmetry is the design: a
+// value is something a program can copy, compare and write to a file,
+// and a server is not one.  A caller that wants this from a remote
+// store is asking to download the corpus, which is `vshttp.scroll`
+// and says so.
+//
+// ```novo
+// use vsstore
+//
+// fn value(m: VsMemory) -> VsCollection
+//     vsstore.snapshot(m)
+// ```
+pub fn snapshot(m: VsMemory) -> VsCollection []
+    todo("vectorstore-nv.vsstore.snapshot")
+
+// The in-memory store performs nothing.
+//
+// `[]` on every method — which is the trait's effect parameter
+// working, and which is what lets `tests/vsstore_tests.nv` drive a
+// whole retrieval pipeline with no row at all.
+//
+// ```novo ignore
+// use vsstore
+//
+// fn find(m: VsMemory, q: VsQuery) -> Result<VsSearchOutcome, VsFault>
+//     m.vs_search(q)
+// ```
+impl VsStore[] for VsMemory
+    fn vs_upsert(self, docs: [VsDoc]) -> Result<Int, VsFault>
+        todo("vectorstore-nv.vsstore.VsMemory.vs_upsert")
+
+    fn vs_delete(self, ids: [Str]) -> Result<Int, VsFault>
+        todo("vectorstore-nv.vsstore.VsMemory.vs_delete")
+
+    fn vs_get(self, ids: [Str]) -> Result<[VsDoc], VsFault>
+        todo("vectorstore-nv.vsstore.VsMemory.vs_get")
+
+    fn vs_search(self, q: VsQuery) -> Result<VsSearchOutcome, VsFault>
+        todo("vectorstore-nv.vsstore.VsMemory.vs_search")
+
+    fn vs_count(self) -> Result<Int, VsFault>
+        todo("vectorstore-nv.vsstore.VsMemory.vs_count")
+
+// Search any store and answer the documents.
+//
+// Effect-polymorphic: `[]` over the in-memory store, `[fs]` over a
+// file, `[net]` over a server.  The one call an application writes,
+// and the reason the trait exists.
+//
+// ```novo ignore
+// use vsstore
+//
+// fn find(s: VsHttp, q: VsQuery) -> Result<VsDocResults, VsFault> [net]
+//     vsstore.retrieve(s, q)
+// ```
+pub fn retrieve<S: VsStore[e]>(s: S, q: VsQuery) -> Result<VsDocResults, VsFault> [e]
+    todo("vectorstore-nv.vsstore.retrieve")
+
+// Insert documents in batches, answering how many landed.
+//
+// A batch size rather than one call per document, because every remote
+// store charges a round trip per request and an ingestion of a hundred
+// thousand documents one at a time is hours of latency.  The in-memory
+// store ignores the size, and that is fine: the call site is the same.
+//
+// ```novo ignore
+// use vsstore
+//
+// fn ingest(s: VsHttp, ds: [VsDoc]) -> Result<Int, VsFault> [net]
+//     vsstore.ingest(s, ds, 128)
+// ```
+pub fn ingest<S: VsStore[e]>(s: S, docs: [VsDoc], batch: Int) -> Result<Int, VsFault> [e]
+    todo("vectorstore-nv.vsstore.ingest")
+
+// Whether a store can answer this query at all.
+//
+// Asked through the trait so the refusal is the same sentence locally
+// and remotely: a hybrid query against a collection with no keyword
+// index is `VsUnsupportedQuery` here and `VsUnsupportedQuery` against
+// a server that has no sparse vectors configured.
+//
+// ```novo ignore
+// use vsstore
+//
+// fn ok(s: VsHttp, q: VsQuery) -> Result<Int, VsFault> [net]
+//     vsstore.check_query(s, q)
+// ```
+pub fn check_query<S: VsStore[e]>(s: S, q: VsQuery) -> Result<Int, VsFault> [e]
+    todo("vectorstore-nv.vsstore.check_query")

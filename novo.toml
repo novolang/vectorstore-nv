@@ -1,0 +1,51 @@
+[package]
+name        = "vectorstore-nv"
+version     = "0.0.1"
+description = "A document store with vectors: documents with text, metadata and an embedding, a typed metadata predicate language, k-nearest search through hnsw-nv with the filter strategy as a named decision rather than a hidden one, BM25 over unicode-nv's tokens, hybrid retrieval merged by reciprocal rank fusion, a file on disk, and the qdrant and chroma HTTP dialects behind the same trait.  Interface only — every body is a todo()."
+license     = "Apache-2.0"
+
+# An INTERFACE release: every `pub fn` body is a `todo()`, so the
+# signatures and the effect rows are published and nothing is
+# implemented.  `novo pkg publish` recognises the shape and requires
+# both the draft stability and the 0.0.x version; the first
+# implementation is the 0.1.0 published over it.
+stability   = "draft"
+
+# `host`, and SIX OF THE NINE MODULES DECLARE NOTHING.  `vsfault`,
+# `vsdoc`, `vsfilter`, `vsbm25`, `vsrank` and `vssearch` are `[]`
+# throughout — a collection is a value, a filter is a value, and
+# ranking is arithmetic over lists the caller already holds.  What
+# performs is `vsfile` (`[fs]`) and `vshttp` (`[net]`), and the store
+# calls in `vsstore` are effect-polymorphic over the trait both sit
+# behind.
+layer       = "host"
+
+category    = "ai"
+
+tags        = ["vector", "search", "embeddings", "hnsw", "bm25", "rag", "retrieval"]
+repository  = "https://github.com/novolang/vectorstore-nv"
+maintainers = ["novo-lang"]
+novo        = ">= 0.8.9"
+
+# A library: no `main`, so `novo pkg build` type-checks and
+# effect-checks every module under `src/` and writes no binary.
+
+[docs.pages]
+"README.md" = "Documents, vectors, and the filter that decides what a search can find"
+
+[dependencies]
+# The index.  `HnswIndex` is a value, every call takes one and returns
+# one, and `hnswio` is the serialised form `vsfile` writes.  `core`, so
+# `dep-layer` holds.
+hnsw-nv = "^0.0.1"
+
+# The similarity half.  `embsim.as_distance` is the one line between
+# hnsw-nv's rule — an index compares by MINIMUM — and a ranking's,
+# which sorts by maximum; getting that backwards is a store that
+# returns the furthest documents and looks like it works.  `core`.
+embeddings-nv = "^0.0.1"
+
+# Tokens for BM25.  Word boundaries and case folding are Unicode
+# questions, and a keyword index that split on ASCII spaces indexes a
+# Japanese document as one term.  `core`.
+unicode-nv = "^0.0.1"

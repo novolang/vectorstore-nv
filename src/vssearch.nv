@@ -1,0 +1,385 @@
+// vssearch.nv — the search, and the decision a filter forces on it.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.  A search over a collection value is arithmetic.
+//
+// **THIS MODULE IS THE LOAD-BEARING INTERFACE OF THE PACKAGE, AND
+// `VsFilterPlan` IS THE VALUE.**
+//
+// A filter and an approximate index do not compose the way everybody
+// assumes.  HNSW is a graph whose search walks from an entry point
+// toward the query, and its guarantee is about a walk over ALL the
+// nodes.  A metadata filter changes which nodes count, and there are
+// only three honest ways to apply it — each with a different failure:
+//
+//   POST-FILTER.  Search for k, then drop what does not match.
+//   **SILENTLY ANSWERS FEWER THAN k.**  A caller asking for 10
+//   documents with `year > 2020` gets 3 — not because only 3 match the
+//   filter, but because only 3 of the top 10 by vector did.  There may
+//   be a thousand matching documents and this finds three of them.
+//   Every naive implementation does this, and the result is a value
+//   that looks exactly like a correct one.
+//
+//   PRE-FILTER.  Evaluate the filter over the corpus, then compare the
+//   query against the survivors exactly.  Always right, and linear in
+//   the number of survivors — fine for a narrow filter, and a full
+//   scan for a broad one.
+//
+//   FILTERED TRAVERSAL.  Walk the graph, skipping nodes the filter
+//   rejects.  hnsw-nv's `search_filtered` is this.  Fast, and its
+//   failure is the interesting one: the graph is connected through the
+//   nodes that were skipped, so a selective filter can DISCONNECT the
+//   matching documents from the entry point and the search answers
+//   nothing at all, even though thousands match.
+//
+// So the plan is a value the caller passes, `VsAuto` chooses by
+// estimated selectivity with the rule written down rather than tuned,
+// and **every result says which plan ran and whether it was
+// exhaustive** — because a caller that cannot tell an approximate
+// answer from a complete one cannot tell a working retrieval pipeline
+// from a broken one.
+//
+// THE SECOND DECISION IS THE ONE THE SCORE DIRECTION HIDES.  hnsw-nv
+// answers DISTANCES and compares by minimum; a ranking sorts by
+// maximum similarity.  `embsim.as_distance` is the one line between
+// them, and getting it backwards produces a store that returns the
+// FURTHEST documents and looks like it works — the answers are
+// documents, they are ordered, and they are wrong.  `VsHit` carries
+// `score` as a SIMILARITY (higher is closer) in every path, and
+// `distance` beside it, so nothing downstream has to know which
+// convention the index used.
+
+use hnswsearch
+use embsim
+
+// How a filter is applied to an approximate search.
+pub enum VsFilterPlan
+    // Choose by estimated selectivity.  The rule is in
+    // `plan_for`'s doc comment, and it is a stated threshold rather
+    // than a tuned one.
+    VsAuto
+    // Search, then drop.  Fast, and answers fewer than k without
+    // saying so unless `over_fetch` is large enough — which is why
+    // `VsSearchOutcome.exhaustive` exists.
+    VsPostFilter(over_fetch: Int)
+    // Filter, then compare exactly.  Always right; linear in the
+    // survivors.
+    VsPreFilter
+    // Walk the graph, skipping rejected nodes.  Fast, and can answer
+    // nothing when the filter disconnects the matches from the entry
+    // point.
+    VsFilteredTraversal
+
+// The plan `VsAuto` would choose, made visible.
+//
+// THE RULE, stated rather than tuned: when the filter's estimated
+// selectivity puts the survivors below `pre_filter_max` documents, a
+// pre-filter is an exact answer over a small set and wins outright.
+// Above that, a filtered traversal, because a linear scan over most of
+// a corpus is the thing an index exists to avoid.  A post-filter is
+// never chosen automatically — it is the plan whose failure is silent,
+// so a caller that wants it asks for it by name.
+//
+// ```novo
+// use vssearch
+//
+// fn main() [io]
+//     match vssearch.plan_for(100, 100000, 10)
+//         VsPreFilter => println("a narrow filter is scanned exactly")
+//         _           => println("something else")
+//     // : a narrow filter is scanned exactly
+// ```
+pub fn plan_for(estimated_matches: Int, corpus_size: Int, k: Int) -> VsFilterPlan []
+    todo("vectorstore-nv.vssearch.plan_for")
+
+// The threshold `plan_for` uses, published so it can be asserted.
+//
+// ```novo
+// use vssearch
+//
+// fn main() [io]
+//     println("${vssearch.pre_filter_max() > 0}")
+//     // : true
+// ```
+pub fn pre_filter_max() -> Int []
+    todo("vectorstore-nv.vssearch.pre_filter_max")
+
+// One query.
+pub struct VsQuery
+    // The query vector.  Empty for a keyword-only search.
+    vector: [Float]
+    // The query text.  Empty for a vector-only search.
+    text: Str
+    k: Int
+    filter: VsFilter
+    plan: VsFilterPlan
+    // hnsw-nv's `ef`: how many candidates the graph walk keeps.  -1
+    // takes the index's default, which `hnswparam.default_ef`
+    // computes from k.
+    ef: Int
+    // The model the query vector came from, checked against the
+    // collection's.  Empty skips the check.
+    model: Str
+
+// A vector query.
+//
+// ```novo
+// use vssearch
+// use vsfilter
+//
+// fn main() [io]
+//     println("${vssearch.query([0.1, 0.2], 10).k}")
+//     // : 10
+// ```
+pub fn query(vector: [Float], k: Int) -> VsQuery []
+    todo("vectorstore-nv.vssearch.query")
+
+// A keyword query.
+//
+// ```novo
+// use vssearch
+//
+// fn main() [io]
+//     println(vssearch.text_query("capital of Denmark", 10).text)
+//     // : capital of Denmark
+// ```
+pub fn text_query(text: Str, k: Int) -> VsQuery []
+    todo("vectorstore-nv.vssearch.text_query")
+
+// A hybrid query: both halves, fused by rank.
+//
+// ```novo
+// use vssearch
+//
+// fn main() [io]
+//     let q = vssearch.hybrid_query([0.1], "denmark", 10)
+//     println("${q.k}")
+//     // : 10
+// ```
+pub fn hybrid_query(vector: [Float], text: Str, k: Int) -> VsQuery []
+    todo("vectorstore-nv.vssearch.hybrid_query")
+
+// The same query with a metadata filter.
+//
+// ```novo
+// use vssearch
+// use vsfilter
+//
+// fn narrowed(q: VsQuery, f: VsFilter) -> VsQuery
+//     vssearch.with_filter(q, f)
+// ```
+pub fn with_filter(q: VsQuery, f: VsFilter) -> VsQuery []
+    todo("vectorstore-nv.vssearch.with_filter")
+
+// The same query with a named filter plan.
+//
+// ```novo
+// use vssearch
+//
+// fn exact(q: VsQuery) -> VsQuery
+//     vssearch.with_plan(q, VsPreFilter)
+// ```
+pub fn with_plan(q: VsQuery, p: VsFilterPlan) -> VsQuery []
+    todo("vectorstore-nv.vssearch.with_plan")
+
+// The same query with an explicit candidate width.
+//
+// ```novo
+// use vssearch
+//
+// fn wider(q: VsQuery) -> VsQuery
+//     vssearch.with_ef(q, 200)
+// ```
+pub fn with_ef(q: VsQuery, ef: Int) -> VsQuery []
+    todo("vectorstore-nv.vssearch.with_ef")
+
+// The same query asserting which model the vector came from.
+//
+// ```novo
+// use vssearch
+//
+// fn checked(q: VsQuery) -> VsQuery
+//     vssearch.with_model(q, "text-embedding-3-small")
+// ```
+pub fn with_model(q: VsQuery, model: Str) -> VsQuery []
+    todo("vectorstore-nv.vssearch.with_model")
+
+// One result.
+pub struct VsHit
+    id: Str
+    // A SIMILARITY: higher is closer, in every path through this
+    // package.  hnsw-nv answers distances and compares by minimum;
+    // `embsim.as_distance` is the one line between the two
+    // conventions, and getting it backwards is a store that returns
+    // the furthest documents and looks like it works.
+    score: Float
+    // The distance the index computed, for a caller that wants the
+    // index's own number — a recall measurement, a threshold tuned
+    // against hnswlib.
+    distance: Float
+    // Where this hit came from, which a hybrid result needs: a
+    // document found by both halves is a stronger signal than one
+    // found by either.
+    source: VsSource
+
+// Which half of a hybrid search produced a hit.
+pub enum VsSource
+    VsFromVector(rank: Int)
+    VsFromKeyword(rank: Int)
+    // Both, with each rank.  The case reciprocal rank fusion exists to
+    // reward, and the one a caller explaining a result to a person
+    // wants to name.
+    VsFromBoth(vector_rank: Int, keyword_rank: Int)
+
+// What a search answered, and how much of the truth it is.
+//
+// **`exhaustive` IS THE FIELD THIS PACKAGE EXISTS TO PUBLISH.**  A
+// result of three documents is either "three documents match" or
+// "three of the ten I looked at match, and I do not know how many
+// others do".  Those are different facts, a caller that cannot tell
+// them apart cannot tell a working retrieval pipeline from a broken
+// one, and no other vector store answers the question.
+pub struct VsSearchOutcome
+    hits: [VsHit]
+    // True when every document that could have matched was considered
+    // — a pre-filter, or an unfiltered search over a small collection.
+    // FALSE for a post-filter that hit its over-fetch limit and for a
+    // filtered traversal, both of which may have missed matches.
+    exhaustive: Bool
+    // Which plan actually ran.  `VsAuto` never appears here: it is a
+    // request, and this is the answer.
+    plan: VsFilterPlan
+    // How many documents the search compared against.  The cost, and
+    // the number that says whether a plan was the right one.
+    examined: Int
+    // How many documents the filter rejected during the search.
+    filtered_out: Int
+
+// Search a collection.
+//
+// The one call, for all three query shapes: `q.vector` and `q.text`
+// decide whether this is a vector search, a keyword search or a hybrid
+// one, so a caller switching between them changes a query value rather
+// than a call.
+//
+// ```novo
+// use vssearch
+//
+// fn find(c: VsCollection, q: VsQuery) -> Bool
+//     match vssearch.search(c, q)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn search(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    todo("vectorstore-nv.vssearch.search")
+
+// Search, and answer the documents rather than the hits.
+//
+// The convenience a retrieval pipeline wants, and it keeps the
+// outcome beside them rather than dropping it — because dropping
+// `exhaustive` is the whole failure this package is about.
+//
+// ```novo
+// use vssearch
+//
+// fn find(c: VsCollection, q: VsQuery) -> Bool
+//     match vssearch.search_docs(c, q)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn search_docs(c: VsCollection, q: VsQuery) -> Result<VsDocResults, VsFault> []
+    todo("vectorstore-nv.vssearch.search_docs")
+
+// Documents and the outcome that produced them.
+pub struct VsDocResults
+    docs: [VsDoc]
+    outcome: VsSearchOutcome
+
+// An exact search over every live document, with no index at all.
+//
+// **THE ORACLE.**  hnsw-nv publishes `brute_force` for the same reason:
+// an approximate index is only worth having if somebody measured how
+// approximate, and `recall_at` needs an exact answer to measure
+// against.  Linear, so it is for a test and for a small collection —
+// and for the caller who would rather scan ten thousand documents than
+// explain a missing one.
+//
+// ```novo
+// use vssearch
+//
+// fn exact(c: VsCollection, q: VsQuery) -> Bool
+//     match vssearch.exact_search(c, q)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn exact_search(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    todo("vectorstore-nv.vssearch.exact_search")
+
+// What fraction of the exact answer an approximate one found.
+//
+// `hnswsearch.recall_at` over ids rather than labels.  The number to
+// put in a commit message when a parameter changes, and the one a
+// caller should measure once on their own corpus rather than trusting
+// a benchmark on somebody else's.
+//
+// ```novo
+// use vssearch
+//
+// fn quality(approx: VsSearchOutcome, exact: VsSearchOutcome) -> Float
+//     vssearch.recall(approx, exact)
+// ```
+pub fn recall(approx: VsSearchOutcome, exact: VsSearchOutcome) -> Float []
+    todo("vectorstore-nv.vssearch.recall")
+
+// Whether a query can be answered by this collection at all.
+//
+// Refuses a hybrid query against a collection with no keyword index, a
+// vector query against one with no vectors, a `k` of zero, and a
+// vector whose model is not the collection's — all before a search
+// runs, because each otherwise answers an empty list a caller reads as
+// "nothing matched".
+//
+// ```novo
+// use vssearch
+//
+// fn ok(c: VsCollection, q: VsQuery) -> Bool
+//     match vssearch.check(c, q)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn check(c: VsCollection, q: VsQuery) -> Result<Int, VsFault> []
+    todo("vectorstore-nv.vssearch.check")
+
+// One line saying what a search did, for a log or an explanation.
+//
+// The plan, whether it was exhaustive, how many documents it examined
+// and how many the filter rejected.  Published because the alternative
+// is every application writing the same four-field sentence, and most
+// of them writing it without `exhaustive`.
+//
+// ```novo
+// use vssearch
+//
+// fn line(o: VsSearchOutcome) -> Str
+//     vssearch.explain(o)
+// ```
+pub fn explain(o: VsSearchOutcome) -> Str []
+    todo("vectorstore-nv.vssearch.explain")
+
+// How many documents a filter is estimated to match.
+//
+// What `VsAuto` decides from.  An ESTIMATE — it evaluates the filter
+// over a sample rather than the corpus — and the sample size is a
+// parameter so a caller that wants the exact count passes the corpus
+// size and pays for it.
+//
+// ```novo
+// use vssearch
+// use vsfilter
+//
+// fn guess(c: VsCollection, f: VsFilter) -> Int
+//     vssearch.estimate_matches(c, f, 1000)
+// ```
+pub fn estimate_matches(c: VsCollection, f: VsFilter, sample: Int) -> Int []
+    todo("vectorstore-nv.vssearch.estimate_matches")

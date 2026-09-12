@@ -1,0 +1,126 @@
+// vsfault.nv — why a store call did not answer what was asked for.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.
+//
+// THE FAULTS WORTH HAVING IN A VECTOR STORE ARE THE ONES A CALLER
+// CANNOT SEE FROM THE RESULT, and that is most of this list:
+//
+//   A DIMENSION MISMATCH.  A collection built with one embedding model
+//   and queried with another answers distances that are arithmetic
+//   nonsense — or, when the dimensions happen to match, plausible
+//   numbers from an unrelated space.  `VsDimMismatch` names both, and
+//   `VsModelMismatch` is the second half: a collection records the
+//   model it was built with, because two models of the same dimension
+//   are still two spaces.
+//
+//   A FILTER THAT MATCHES NOTHING AND A FILTER THAT IS WRONG look the
+//   same from an empty result.  `VsBadFilter` names the field and the
+//   reason, so "no documents matched" and "you compared a string to a
+//   number" are different answers.
+//
+//   A SEARCH THAT RAN OUT OF CANDIDATES.  See `vssearch`: this is the
+//   one that is not a fault at all and is reported on the result
+//   instead, because a truncated search answers documents.
+
+// Why a store call did not answer what was asked for.
+pub enum VsFault
+    // A vector of the wrong length for the collection.
+    VsDimMismatch(want: Int, got: Int)
+    // A vector whose model name is not the collection's.  A separate
+    // variant from the dimension, because two models of the same
+    // dimension are still two spaces and the numbers look fine.
+    VsModelMismatch(want: Str, got: Str)
+    // A coordinate that is not a finite number.  Caught on the way in,
+    // because downstream it is silent: a NaN coordinate makes every
+    // distance NaN and the document is simply never the nearest.
+    VsNotFinite(id: Str, at: Int)
+    // No document with this id.
+    VsNoSuchDoc(id: Str)
+    // A document id that is already in the collection, on an insert
+    // that is not an upsert.
+    VsDuplicateId(id: Str)
+    // A filter that cannot be evaluated: a comparison between a string
+    // and a number, a range whose bounds are the wrong way round, a
+    // field path that is not a path.
+    VsBadFilter(field: Str, why: Str)
+    // A query the store cannot run — a hybrid search on a collection
+    // with no keyword index, a vector search on one with no vectors.
+    VsUnsupportedQuery(what: Str)
+    // The file is not a collection, or is a version this package does
+    // not read.
+    VsBadFile(what: Str)
+    // A file operation failed.
+    VsIoFailed(path: Str, message: Str)
+    // A remote store answered an error.  `code` is the server's own,
+    // because the sentence beside it differs between qdrant and chroma
+    // for the same condition.
+    VsRemoteFailed(status: Int, code: Str, message: Str)
+    // The remote transport failed.
+    VsTransportFailed(message: Str)
+    // The remote answered 2xx with a body that was not the shape its
+    // dialect promises.
+    VsMalformedReply(what: Str)
+    // The index refused.  Carries hnsw-nv's own reason as text, since
+    // `HnswFault` is that package's type and re-declaring its variants
+    // here would be a second original that goes stale.
+    VsIndexFailed(why: Str)
+
+// Whether trying again could produce a different answer.
+//
+// TRUE for `VsTransportFailed` and a 5xx `VsRemoteFailed`; false for
+// everything else.
+//
+// ```novo
+// use vsfault
+//
+// fn main() [io]
+//     println("${vsfault.is_retryable(VsNoSuchDoc("a"))}")
+//     // : false
+// ```
+pub fn is_retryable(f: VsFault) -> Bool []
+    todo("vectorstore-nv.vsfault.is_retryable")
+
+// Whether the fault is in the caller's own request.
+//
+// ```novo
+// use vsfault
+//
+// fn main() [io]
+//     println("${vsfault.is_caller_error(VsDimMismatch(768, 384))}")
+//     // : true
+// ```
+pub fn is_caller_error(f: VsFault) -> Bool []
+    todo("vectorstore-nv.vsfault.is_caller_error")
+
+// The rule every `VsFault` is printed by: name what was compared, and
+// print both sides.
+//
+// `Result<T, E>` requires `E: Error` (SPEC § 3.4), so this impl is what
+// makes every fallible signature in the package spellable.  It carries
+// a body on an interface release because a panic reporting a fault
+// through a `todo()` would print the wrong sentence.
+//
+// ```novo ignore
+// use vsfault
+//
+// fn why(f: VsFault) -> Str
+//     f.message()
+// ```
+impl Error for VsFault
+    fn message(self) -> Str
+        match self
+            VsDimMismatch(want, got)          => "a vector of ${got} into a collection of ${want}"
+            VsModelMismatch(want, got)        => "a vector from ${got} into a collection built with ${want}"
+            VsNotFinite(id, at)               => "coordinate ${at} of ${id} is not a finite number"
+            VsNoSuchDoc(id)                   => "no document with the id ${id}"
+            VsDuplicateId(id)                 => "${id} is already in the collection"
+            VsBadFilter(field, why)           => "the filter on ${field} cannot be evaluated: ${why}"
+            VsUnsupportedQuery(what)          => "this collection cannot answer ${what}"
+            VsBadFile(what)                   => "the file is not a collection: ${what}"
+            VsIoFailed(path, why)             => "${path}: ${why}"
+            VsRemoteFailed(status, code, why) => "${status} ${code}: ${why}"
+            VsTransportFailed(why)            => "the request never completed: ${why}"
+            VsMalformedReply(what)            => "the reply had no ${what}"
+            VsIndexFailed(why)                => "the index refused: ${why}"

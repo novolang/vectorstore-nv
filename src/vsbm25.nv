@@ -1,0 +1,266 @@
+// vsbm25.nv — the keyword half: Okapi BM25 over unicode-nv's tokens.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.  An index is a value and scoring is arithmetic.
+//
+// WHY A KEYWORD INDEX IS IN A VECTOR STORE AT ALL.  An embedding is a
+// summary, and a summary loses exactly the things a person searches
+// for when they know what they want: a product code, an error number,
+// a surname, a version string.  `ORA-01555` and `ORA-01552` embed to
+// nearly the same point and mean different things; BM25 tells them
+// apart because it never looked at meaning.  The two retrievers fail
+// in opposite directions, which is why fusing them works and why
+// `vsrank` exists.
+//
+// THE TOKENISER IS unicode-nv's AND NOT A SPLIT ON SPACES.  Word
+// boundaries and case folding are Unicode questions: a keyword index
+// that split on ASCII whitespace indexes a Japanese document as one
+// enormous term and matches nothing, and one that lowercased with
+// ASCII rules leaves `STRASSE` and `straße` as different terms.
+// `ugrapheme` and `ucase` are the calls.
+//
+// AND THE PARAMETERS ARE NAMED WITH THEIR PROVENANCE.  `k1` at 1.2 and
+// `b` at 0.75 are Robertson and Walker's own, which is what makes a
+// port checkable rather than tuned; `bm25_plus_delta` is Lv and Zhai's
+// correction for long documents, off by default and named so that
+// turning it on is a decision somebody made.
+
+use std.list
+
+// BM25's parameters.
+pub struct VsBm25Params
+    // Term-frequency saturation.  1.2 is Robertson and Walker's, and
+    // is what the reference implementations use.
+    k1: Float
+    // Length normalisation, 0 to 1.  0.75 is theirs too; 0 ignores
+    // document length entirely and 1 normalises fully.
+    b: Float
+    // Lv and Zhai's BM25+ lower bound, which stops a very long
+    // document scoring below a shorter one that does not contain the
+    // term at all.  0.0 is plain BM25 and is the default, because a
+    // port should be the thing it ports before it is an improvement on
+    // it.
+    delta: Float
+
+// Robertson and Walker's numbers.
+//
+// ```novo
+// use vsbm25
+//
+// fn main() [io]
+//     println("${vsbm25.default_params().k1}")
+//     // : 1.2
+// ```
+pub fn default_params() -> VsBm25Params []
+    todo("vectorstore-nv.vsbm25.default_params")
+
+// Parameters of the caller's own.
+//
+// ```novo
+// use vsbm25
+//
+// fn main() [io]
+//     println("${vsbm25.params(1.5, 0.75, 0.0).k1}")
+//     // : 1.5
+// ```
+pub fn params(k1: Float, b: Float, delta: Float) -> VsBm25Params []
+    todo("vectorstore-nv.vsbm25.params")
+
+// How text becomes terms.
+pub struct VsTokenizer
+    // Fold case before indexing.  On by default; `ucase`'s full
+    // folding rather than an ASCII lowercase, so `STRASSE` and
+    // `straße` are one term.
+    fold_case: Bool
+    // Drop terms shorter than this, in grapheme clusters.  1 keeps
+    // everything, which is what a corpus of code or part numbers
+    // wants.
+    min_length: Int
+    // Terms to drop.  EMPTY BY DEFAULT, and that is a decision: a stop
+    // word list is language-specific, every list disagrees with every
+    // other, and dropping `not` from a corpus of requirements changes
+    // what the corpus says.  A caller with one passes it.
+    stop_words: [Str]
+
+// The default tokeniser: fold case, keep everything, no stop words.
+//
+// ```novo
+// use vsbm25
+//
+// fn main() [io]
+//     println("${vsbm25.tokenizer().fold_case}")
+//     // : true
+// ```
+pub fn tokenizer() -> VsTokenizer []
+    todo("vectorstore-nv.vsbm25.tokenizer")
+
+// The same tokeniser with a stop-word list.
+//
+// ```novo
+// use vsbm25
+//
+// fn main() [io]
+//     println("${list.len(vsbm25.with_stop_words(vsbm25.tokenizer(), ["the"]).stop_words)}")
+//     // : 1
+// ```
+pub fn with_stop_words(t: VsTokenizer, words: [Str]) -> VsTokenizer []
+    todo("vectorstore-nv.vsbm25.with_stop_words")
+
+// Split text into terms.
+//
+// Word boundaries are `ugrapheme`'s, not a split on spaces.  This is
+// the one function a caller might want to replace, and it is public so
+// they can index with their own terms and score with these.
+//
+// ```novo
+// use vsbm25
+//
+// fn terms(t: VsTokenizer, text: Str) -> Int
+//     list.len(vsbm25.tokenize(t, text))
+// ```
+pub fn tokenize(t: VsTokenizer, text: Str) -> [Str] []
+    todo("vectorstore-nv.vsbm25.tokenize")
+
+// Build an index over a corpus.
+//
+// The documents in the order they will be referred to by index, which
+// is the collection's own order.
+//
+// ```novo
+// use vsbm25
+//
+// fn build(t: VsTokenizer, texts: [Str]) -> Bool
+//     match vsbm25.build(t, texts)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn build(t: VsTokenizer, texts: [Str]) -> Result<VsKeywordIndex, VsFault> []
+    todo("vectorstore-nv.vsbm25.build")
+
+// An empty index.
+//
+// ```novo
+// use vsbm25
+//
+// fn main() [io]
+//     println("${vsbm25.empty_index().total_len}")
+//     // : 0
+// ```
+pub fn empty_index() -> VsKeywordIndex []
+    todo("vectorstore-nv.vsbm25.empty_index")
+
+// Add one document to an index.
+//
+// ```novo
+// use vsbm25
+//
+// fn add(ix: VsKeywordIndex, t: VsTokenizer, text: Str) -> Bool
+//     match vsbm25.add(ix, t, text)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn add(ix: VsKeywordIndex, t: VsTokenizer, text: Str) -> Result<VsKeywordIndex, VsFault> []
+    todo("vectorstore-nv.vsbm25.add")
+
+// Score every document against a query.
+//
+// Answers one score per document, in the index's own order, zero for a
+// document containing none of the query's terms.  A list rather than a
+// ranking, because `vsrank` is what ranks and this is what it ranks.
+//
+// ```novo
+// use vsbm25
+//
+// fn scores(ix: VsKeywordIndex, t: VsTokenizer, p: VsBm25Params, q: Str) -> Int
+//     list.len(vsbm25.score_all(ix, t, p, q))
+// ```
+pub fn score_all(ix: VsKeywordIndex, t: VsTokenizer, p: VsBm25Params, query: Str) -> [Float] []
+    todo("vectorstore-nv.vsbm25.score_all")
+
+// The top k documents by score, as index positions.
+//
+// ```novo
+// use vsbm25
+//
+// fn top(ix: VsKeywordIndex, t: VsTokenizer, p: VsBm25Params, q: Str) -> Int
+//     list.len(vsbm25.top_k(ix, t, p, q, 10))
+// ```
+pub fn top_k(ix: VsKeywordIndex, t: VsTokenizer, p: VsBm25Params, query: Str,
+             k: Int) -> [VsTermHit] []
+    todo("vectorstore-nv.vsbm25.top_k")
+
+// One keyword hit.
+pub struct VsTermHit
+    // The document's position in the collection.
+    at: Int
+    score: Float
+
+// One term's inverse document frequency.
+//
+// Published because it is the number that explains a result: a query
+// whose rare term matched nothing and whose common term matched
+// everything produces a ranking that looks arbitrary, and this is what
+// shows why.
+//
+// ```novo
+// use vsbm25
+//
+// fn rarity(ix: VsKeywordIndex, term: Str) -> Float
+//     vsbm25.idf(ix, term)
+// ```
+pub fn idf(ix: VsKeywordIndex, term: Str) -> Float []
+    todo("vectorstore-nv.vsbm25.idf")
+
+// How many documents contain a term.
+//
+// ```novo
+// use vsbm25
+//
+// fn n(ix: VsKeywordIndex, term: Str) -> Int
+//     vsbm25.doc_frequency(ix, term)
+// ```
+pub fn doc_frequency(ix: VsKeywordIndex, term: Str) -> Int []
+    todo("vectorstore-nv.vsbm25.doc_frequency")
+
+// The average document length the index was built over.
+//
+// BM25's `avgdl`, and the reason an index cannot be scored against a
+// document that is not in it: the normalisation is relative to the
+// corpus.
+//
+// ```novo
+// use vsbm25
+//
+// fn avg(ix: VsKeywordIndex) -> Float
+//     vsbm25.average_length(ix)
+// ```
+pub fn average_length(ix: VsKeywordIndex) -> Float []
+    todo("vectorstore-nv.vsbm25.average_length")
+
+// Which of a query's terms the index has never seen.
+//
+// The answer to "why did my search return nothing": a query of three
+// terms none of which is in the corpus scores every document zero, and
+// an empty result says nothing about which of the three was the
+// problem.
+//
+// ```novo
+// use vsbm25
+//
+// fn unknown(ix: VsKeywordIndex, t: VsTokenizer, q: Str) -> Int
+//     list.len(vsbm25.unknown_terms(ix, t, q))
+// ```
+pub fn unknown_terms(ix: VsKeywordIndex, t: VsTokenizer, query: Str) -> [Str] []
+    todo("vectorstore-nv.vsbm25.unknown_terms")
+
+// How many distinct terms the index holds.
+//
+// ```novo
+// use vsbm25
+//
+// fn n(ix: VsKeywordIndex) -> Int
+//     vsbm25.term_count(ix)
+// ```
+pub fn term_count(ix: VsKeywordIndex) -> Int []
+    todo("vectorstore-nv.vsbm25.term_count")

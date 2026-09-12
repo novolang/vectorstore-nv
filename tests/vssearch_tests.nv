@@ -1,0 +1,251 @@
+// vssearch_tests.nv — the filter and the approximate index, which do
+// not compose the way everybody assumes.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// vectorstore-nv.<module>.<fn>`.  That is the expected result until
+// the bodies land.
+//
+// NO SOCKET AND NO FILE IN THIS FILE.  `vsdoc`, `vsfilter`, `vssearch`
+// and `vsrank` are `core`-shaped inside a `host` package: every row is
+// `[]`, so a whole retrieval pipeline is values here.
+
+use std.test
+use std.json
+use std.list
+use hnswparam
+use vsdoc
+use vsfault
+use vsfilter
+use vssearch
+
+fn a_config() -> VsConfig
+    match hnswparam.default_params(2, HnswCosine)
+        Ok(p)  => vsdoc.config(2, HnswCosine, "test-model", p)
+        Err(_) => vsdoc.config(2, HnswCosine, "test-model", hnswparam.default_params(2, HnswCosine)!)
+
+fn a_doc(id: Str, year: Int, x: Float) -> VsDoc
+    vsdoc.with_metadata(vsdoc.doc(id, id, [x, 1.0]),
+                        json.object([("year", json.int(year))]))
+
+fn a_collection() -> VsCollection
+    vsdoc.collection("notes", a_config())
+
+@test
+fn test_a_post_filter_answers_fewer_than_k_without_saying_so() [io]
+    // THE FAILURE EVERY NAIVE IMPLEMENTATION HAS.  A caller asking for
+    // 10 documents with `year > 2020` gets 3 — not because only 3
+    // match, but because only 3 of the top 10 by vector did.  The
+    // result looks exactly like a correct one.
+    var c = a_collection()
+    match vsdoc.upsert(c, a_doc("a", 2019, 0.1), "test-model")
+        Ok(next) =>
+            c = next
+        Err(_)   => test.assert(false)
+
+    let q = vssearch.with_plan(
+                vssearch.with_filter(vssearch.query([0.1, 1.0], 10),
+                                     vsfilter.is_clause(VsGt("year", VsInt(2020)))),
+                VsPostFilter(10))
+
+    match vssearch.search(c, q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("the result says it is not the whole truth")
+            test.assert(o.exhaustive == false)
+
+            test.case("and which plan produced it")
+            match o.plan
+                VsPostFilter(_) => test.assert(true)
+                _               => test.assert(false)
+
+@test
+fn test_a_pre_filter_is_exhaustive_and_says_so() [io]
+    // Always right, linear in the survivors.  The plan a caller picks
+    // when a missing document is worse than a slow query.
+    var c = a_collection()
+    match vsdoc.upsert(c, a_doc("a", 2021, 0.1), "test-model")
+        Ok(next) =>
+            c = next
+        Err(_)   => test.assert(false)
+
+    let q = vssearch.with_plan(
+                vssearch.with_filter(vssearch.query([0.1, 1.0], 10),
+                                     vsfilter.is_clause(VsGt("year", VsInt(2020)))),
+                VsPreFilter)
+
+    match vssearch.search(c, q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("every candidate was considered")
+            test.assert(o.exhaustive)
+
+@test
+fn test_auto_never_chooses_the_plan_whose_failure_is_silent() [io]
+    // A post-filter is the plan a caller has to ask for by name.
+    match vssearch.plan_for(100, 100000, 10)
+        VsPostFilter(_) => test.assert(false)
+        _               => test.assert(true)
+
+    match vssearch.plan_for(90000, 100000, 10)
+        VsPostFilter(_) => test.assert(false)
+        _               => test.assert(true)
+
+@test
+fn test_a_narrow_filter_is_scanned_exactly_and_a_broad_one_is_traversed() [io]
+    // The rule, stated rather than tuned: below the threshold a
+    // pre-filter is exact over a small set; above it a linear scan
+    // over most of a corpus is what an index exists to avoid.
+    test.assert(vssearch.pre_filter_max() > 0)
+
+    match vssearch.plan_for(10, 1000000, 10)
+        VsPreFilter => test.assert(true)
+        _           => test.assert(false)
+
+    match vssearch.plan_for(900000, 1000000, 10)
+        VsFilteredTraversal => test.assert(true)
+        _                   => test.assert(false)
+
+@test
+fn test_an_unfiltered_search_over_a_small_collection_is_exhaustive() [io]
+    var c = a_collection()
+    match vsdoc.upsert(c, a_doc("a", 2021, 0.1), "test-model")
+        Ok(next) =>
+            c = next
+        Err(_)   => test.assert(false)
+
+    match vssearch.search(c, vssearch.query([0.1, 1.0], 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(o.exhaustive)
+
+@test
+fn test_the_score_is_a_similarity_in_every_path() [io]
+    // hnsw-nv compares by MINIMUM distance and a ranking sorts by
+    // maximum similarity.  Getting this backwards is a store that
+    // returns the furthest documents and looks like it works.
+    var c = a_collection()
+    match vsdoc.upsert_many(c, [a_doc("near", 2021, 1.0), a_doc("far", 2021, -1.0)],
+                            "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+
+    match vssearch.search(c, vssearch.query([1.0, 1.0], 2))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            match list.first(o.hits)
+                None    => test.assert(false)
+                Some(h) =>
+                    test.case("the nearest document is first")
+                    test.assert(h.id == "near")
+
+                    test.case("its score is a similarity, higher being closer")
+                    test.assert(h.score > 0.0)
+
+                    test.case("and the index's own distance is beside it")
+                    test.assert(h.distance >= 0.0)
+
+@test
+fn test_a_query_from_another_model_is_refused_before_it_runs() [io]
+    // Two models of the same dimension are two spaces.  The distances
+    // are arithmetic, plausible and meaningless, and nothing else in a
+    // retrieval pipeline catches it.
+    let c = a_collection()
+    let q = vssearch.with_model(vssearch.query([0.1, 1.0], 10), "another-model")
+
+    match vssearch.check(c, q)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(vsfault.is_caller_error(f))
+
+@test
+fn test_a_hybrid_query_against_a_collection_with_no_keyword_index_is_refused() [io]
+    // Rather than quietly becoming a vector search.
+    let c = a_collection()
+    let q = vssearch.hybrid_query([0.1, 1.0], "denmark", 10)
+
+    match vssearch.check(c, q)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_exact_search_is_the_oracle_the_approximate_one_is_measured_against() [io]
+    // An approximate index is only worth having if somebody measured
+    // how approximate.
+    var c = a_collection()
+    match vsdoc.upsert(c, a_doc("a", 2021, 0.1), "test-model")
+        Ok(next) =>
+            c = next
+        Err(_)   => test.assert(false)
+
+    let q = vssearch.query([0.1, 1.0], 1)
+
+    match vssearch.exact_search(c, q)
+        Err(_)   => test.assert(false)
+        Ok(want) =>
+            test.case("an exact search is always exhaustive")
+            test.assert(want.exhaustive)
+
+            match vssearch.search(c, q)
+                Err(_)  => test.assert(false)
+                Ok(got) =>
+                    test.case("and recall is measurable against it")
+                    test.assert(vssearch.recall(got, want) >= 0.0)
+
+@test
+fn test_a_search_says_what_it_did() [io]
+    var c = a_collection()
+    match vsdoc.upsert(c, a_doc("a", 2019, 0.1), "test-model")
+        Ok(next) =>
+            c = next
+        Err(_)   => test.assert(false)
+
+    let q = vssearch.with_filter(vssearch.query([0.1, 1.0], 10),
+                                 vsfilter.is_clause(VsGt("year", VsInt(2020))))
+
+    match vssearch.search(c, q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("how many documents it compared against")
+            test.assert(o.examined > 0)
+
+            test.case("how many the filter rejected")
+            test.assert(o.filtered_out >= 1)
+
+            test.case("and one line a log can carry")
+            test.assert(vssearch.explain(o) != "")
+
+@test
+fn test_a_candidate_width_and_a_k_are_separate_numbers() [io]
+    let q = vssearch.with_ef(vssearch.query([0.1, 1.0], 10), 200)
+
+    test.assert(q.k == 10)
+    test.assert(q.ef == 200)
+
+@test
+fn test_the_document_shape_answers_documents_and_keeps_the_outcome() [io]
+    // Dropping `exhaustive` is the whole failure this package is
+    // about, so the convenience keeps it.
+    var c = a_collection()
+    match vsdoc.upsert(c, a_doc("a", 2021, 0.1), "test-model")
+        Ok(next) =>
+            c = next
+        Err(_)   => test.assert(false)
+
+    match vssearch.search_docs(c, vssearch.query([0.1, 1.0], 10))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert(list.len(r.docs) >= 0)
+            test.assert(r.outcome.exhaustive)
+
+@test
+fn test_a_filter_s_selectivity_is_estimated_from_a_sample() [io]
+    let c = a_collection()
+    test.assert(vssearch.estimate_matches(c, VsAll, 100) >= 0)
+
+@test
+fn test_a_text_query_is_the_same_value_with_the_other_half_filled_in() [io]
+    let q = vssearch.text_query("capital of Denmark", 5)
+
+    test.assert(q.text == "capital of Denmark")
+    test.assert(list.len(q.vector) == 0)
+    test.assert(q.k == 5)

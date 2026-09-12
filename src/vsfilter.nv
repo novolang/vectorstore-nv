@@ -1,0 +1,283 @@
+// vsfilter.nv — the metadata predicate language.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.  A filter is a value and evaluating one is
+// arithmetic over a JSON value the caller already holds.
+//
+// A SMALL TYPED LANGUAGE AND NOT A STRING.  Every remote store in this
+// space takes a filter as a nested JSON object, and the temptation is
+// to let the caller write one — which makes every filter a run-time
+// parse, makes a typo a 400 from a server, and makes the two dialects'
+// incompatible spellings the caller's problem.  A value instead: the
+// compiler checks it, `vsstore` evaluates it locally, and `vshttp`
+// translates it per dialect.
+//
+// WHAT IS DELIBERATELY NOT IN IT, and why each would cost more than it
+// is worth:
+//
+//   NO ARBITRARY EXPRESSIONS.  No arithmetic, no field-to-field
+//   comparison, no functions.  Everything here translates to BOTH
+//   remote dialects; a construct that only one supports would make
+//   `vshttp` refuse at run time for a filter the compiler accepted,
+//   which is the failure this language exists to prevent.
+//
+//   NO `NOT` OVER AN ARBITRARY SUBTREE — only `VsNot` over one clause.
+//   Negation interacts badly with missing fields: `not (year > 2020)`
+//   is true for a document with no `year` at all, which is almost
+//   never what the person meant, and a store that allowed it over a
+//   whole conjunction would make that surprise unreadable.  The
+//   one-clause form keeps it visible, and `VsMissing` is the
+//   explicit way to ask.
+//
+//   NO IMPLICIT TYPE COERCION.  `"2021" > 2020` is `VsBadFilter`, not
+//   true and not false.  Both remote dialects silently answer false,
+//   which is indistinguishable from "no documents matched".
+
+use std.json
+use std.list
+
+// One value a filter compares against.
+//
+// A closed set, because it is what both remote dialects can carry.
+pub enum VsValue
+    VsStr(text: Str)
+    VsInt(n: Int)
+    VsFloat(x: Float)
+    VsBool(b: Bool)
+
+// One clause.
+//
+// `field` is a dot path into the document's metadata — `source.kind` —
+// which is `json.query`'s own spelling and what both remote dialects
+// accept.
+pub enum VsClause
+    // Equal.  Types must match; `VsBadFilter` otherwise.
+    VsEq(field: Str, value: VsValue)
+    VsNe(field: Str, value: VsValue)
+    VsLt(field: Str, value: VsValue)
+    VsLte(field: Str, value: VsValue)
+    VsGt(field: Str, value: VsValue)
+    VsGte(field: Str, value: VsValue)
+    // Any of these values.  One clause rather than a disjunction of
+    // equalities because both remote dialects have it natively and it
+    // is the shape a faceted filter actually takes.
+    VsIn(field: Str, values: [VsValue])
+    // The field's array contains this value.  A `tags` list is the
+    // commonest metadata shape there is, and without this a caller
+    // must flatten it into named fields at ingestion.
+    VsContains(field: Str, value: VsValue)
+    // The field is present, whatever its value.  Explicit, because
+    // the alternative is inferring it from a negation and the
+    // inference is where the surprises live.
+    VsExists(field: Str)
+    // The field is absent or JSON null.  Named separately from
+    // `VsExists` negated, because `null` and absent are two states and
+    // `json.is_null` is the call that tells them apart.
+    VsMissing(field: Str)
+    // A text prefix.  Both dialects have it; a substring match and a
+    // regular expression do not translate and are absent on purpose.
+    VsPrefix(field: Str, text: Str)
+
+// A filter.
+pub enum VsFilter
+    // Matches everything.  The identity, so a caller building a filter
+    // conditionally never needs an optional.
+    VsAll
+    // Matches nothing.  Published because "the user selected no
+    // facets" and "the user selected an impossible combination" are
+    // different, and a store that answered `VsAll` for the second
+    // returns the whole corpus.
+    VsNone
+    VsAnd(parts: [VsFilter])
+    VsOr(parts: [VsFilter])
+    // Negation of ONE clause.  See the module header.
+    VsNot(part: VsClause)
+    VsIs(part: VsClause)
+
+// A filter from one clause.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     let f = vsfilter.is_clause(VsGt("year", VsInt(2020)))
+//     println("${vsfilter.clause_count(f)}")
+//     // : 1
+// ```
+pub fn is_clause(c: VsClause) -> VsFilter []
+    todo("vectorstore-nv.vsfilter.is_clause")
+
+// Every clause must hold.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     let f = vsfilter.all_of([vsfilter.is_clause(VsEq("lang", VsStr("da")))])
+//     println("${vsfilter.clause_count(f)}")
+//     // : 1
+// ```
+pub fn all_of(parts: [VsFilter]) -> VsFilter []
+    todo("vectorstore-nv.vsfilter.all_of")
+
+// Any clause may hold.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     let f = vsfilter.any_of([vsfilter.is_clause(VsEq("lang", VsStr("da")))])
+//     println("${vsfilter.clause_count(f)}")
+//     // : 1
+// ```
+pub fn any_of(parts: [VsFilter]) -> VsFilter []
+    todo("vectorstore-nv.vsfilter.any_of")
+
+// Whether a filter is well formed, before anything runs it.
+//
+// What it refuses, each of which is otherwise an empty result a caller
+// reads as "nothing matched":
+//
+//   A COMPARISON BETWEEN TWO TYPES.  `VsGt("year", VsStr("2020"))`
+//   against a numeric field.  Both remote dialects answer false.
+//
+//   AN ORDERING ON A BOOLEAN, which has no order worth relying on.
+//
+//   AN EMPTY `VsIn`, which matches nothing and is almost always a
+//   caller that filtered a list down to zero without noticing.
+//
+//   AN EMPTY `VsAnd` OR `VsOr`, which are `VsAll` and `VsNone` — and
+//   the two are opposite answers, so a store that picked one silently
+//   returns either the whole corpus or none of it.
+//
+//   A FIELD PATH THAT IS NOT A PATH.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     match vsfilter.check(vsfilter.is_clause(VsIn("lang", [])))
+//         Ok(_)  => println("accepted")
+//         Err(_) => println("an empty IN matches nothing")
+//     // : an empty IN matches nothing
+// ```
+pub fn check(f: VsFilter) -> Result<Int, VsFault> []
+    todo("vectorstore-nv.vsfilter.check")
+
+// Whether one document's metadata satisfies the filter.
+//
+// The local evaluator, and the definition every remote translation is
+// measured against: `tests/vsfilter_tests.nv` asserts the same filter
+// and the same document through this and through each dialect's
+// translation, which is what keeps the three from drifting.
+//
+// ```novo
+// use vsfilter
+// use std.json
+//
+// fn main() [io]
+//     match vsfilter.matches(VsAll, json.object([]))
+//         Ok(b)  => println("${b}")
+//         Err(_) => println("bad filter")
+//     // : true
+// ```
+pub fn matches(f: VsFilter, metadata: JsonValueH) -> Result<Bool, VsFault> []
+    todo("vectorstore-nv.vsfilter.matches")
+
+// How many clauses a filter holds, at every depth.
+//
+// The number `vssearch` uses to estimate a filter's cost, and the one
+// a caller should look at before sending a machine-generated filter to
+// a remote store with a request-size limit.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     println("${vsfilter.clause_count(VsAll)}")
+//     // : 0
+// ```
+pub fn clause_count(f: VsFilter) -> Int []
+    todo("vectorstore-nv.vsfilter.clause_count")
+
+// Every metadata field a filter names, without duplicates.
+//
+// For a store deciding which fields are worth an index, and for a
+// caller checking a filter against a corpus it knows the shape of.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     println("${list.len(vsfilter.fields_of(VsAll))}")
+//     // : 0
+// ```
+pub fn fields_of(f: VsFilter) -> [Str] []
+    todo("vectorstore-nv.vsfilter.fields_of")
+
+// The filter with redundant structure removed.
+//
+// `VsAnd` of one is that one; `VsAll` inside a conjunction disappears;
+// `VsNone` inside one swallows it.  Published rather than hidden
+// inside `matches`, because a caller building a filter from a user
+// interface wants to SHOW the simplified form.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     println("${vsfilter.clause_count(vsfilter.simplify(vsfilter.all_of([VsAll])))}")
+//     // : 0
+// ```
+pub fn simplify(f: VsFilter) -> VsFilter []
+    todo("vectorstore-nv.vsfilter.simplify")
+
+// Whether a filter can match anything at all.
+//
+// False for `VsNone` and for a conjunction that contains it.  The
+// check that tells "your filter is impossible" apart from "nothing in
+// the corpus matched", which is the difference between a bug in a
+// query builder and an empty shelf.
+//
+// ```novo
+// use vsfilter
+//
+// fn main() [io]
+//     println("${vsfilter.is_satisfiable(VsNone)}")
+//     // : false
+// ```
+pub fn is_satisfiable(f: VsFilter) -> Bool []
+    todo("vectorstore-nv.vsfilter.is_satisfiable")
+
+// A value from a JSON value, or None for one this language cannot
+// carry.
+//
+// An object and an array are not comparable values here, which is the
+// same restriction both remote dialects have.
+//
+// ```novo
+// use vsfilter
+// use std.json
+//
+// fn main() [io]
+//     match vsfilter.value_of(json.int(7))
+//         Some(_) => println("carried")
+//         None    => println("not a scalar")
+//     // : carried
+// ```
+pub fn value_of(v: JsonValueH) -> ?VsValue []
+    todo("vectorstore-nv.vsfilter.value_of")
+
+// The value as JSON, for a remote dialect's body.
+//
+// ```novo
+// use vsfilter
+// use std.json
+//
+// fn main() [io]
+//     println(json.type_of(vsfilter.value_json(VsInt(7))))
+//     // : number
+// ```
+pub fn value_json(v: VsValue) -> JsonValueH []
+    todo("vectorstore-nv.vsfilter.value_json")

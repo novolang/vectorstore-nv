@@ -1,0 +1,274 @@
+// vsfile.nv — a collection on disk.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[fs]`, and only here.  The format is `[]` — `to_bytes` and
+// `from_bytes` are published beside the file calls, so a caller that
+// keeps its collection in a database column, an object store or a zip
+// entry never touches this module's effect row.
+//
+// THE FILE CARRIES hnsw-nv's SERIALISED INDEX RATHER THAN REBUILDING
+// IT.  A hundred thousand vectors take minutes to index and
+// milliseconds to read, so a store that rebuilt on load would make
+// every process start pay for every other one's work.  `hnswio` has a
+// magic, a version and stated widths, which is what makes that safe;
+// hnswlib's own raw memory dump has none of the three and cannot be
+// read by a different build of the same library.
+//
+// AND THE FILE RECORDS THE MODEL.  `VsConfig.model` is in the header,
+// so loading a collection built with one embedding model into a
+// program that queries with another is refused at LOAD rather than
+// producing confident nonsense at query time.
+//
+// WHAT THE FORMAT IS NOT: it is not a database.  There is no
+// concurrent writer, no partial update and no transaction — `save`
+// writes the whole collection and `load` reads it.  A corpus that
+// changes faster than it can be rewritten wants a server, which is
+// `vshttp`.  That line is stated here rather than discovered at the
+// size where it starts mattering.
+
+use std.list
+
+// The magic the file begins with.
+//
+// Published so a caller sniffing a directory can tell a collection
+// from anything else without opening it as one.
+pub const VS_FILE_MAGIC = "NVVS"
+
+// The format version this package writes.
+pub const VS_FILE_VERSION = 1
+
+// The versions this package can read.
+//
+// ```novo
+// use vsfile
+//
+// fn main() [io]
+//     println("${list.len(vsfile.supported_versions())}")
+//     // : 1
+// ```
+pub fn supported_versions() -> [Int] []
+    todo("vectorstore-nv.vsfile.supported_versions")
+
+// What a file's header says, without reading the rest of it.
+pub struct VsFileHeader
+    version: Int
+    name: Str
+    dim: Int
+    // The embedding model the collection was built with.  In the
+    // header so a mismatch is caught before a vector is read.
+    model: Str
+    doc_count: Int
+    deleted_count: Int
+    // The size the whole file should be, for a caller checking a
+    // download or a truncated write.
+    total_bytes: Int
+
+// The whole collection as bytes.
+//
+// `[]`.  For a caller that keeps its collections somewhere other than
+// a file — a database column, an object store, a zip entry — and for
+// a test that asserts the bytes with no filesystem.
+//
+// ```novo
+// use vsfile
+//
+// fn bytes(c: VsCollection) -> Bool
+//     match vsfile.to_bytes(c)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn to_bytes(c: VsCollection) -> Result<Bytes, VsFault> []
+    todo("vectorstore-nv.vsfile.to_bytes")
+
+// A collection from bytes.
+//
+// `[]`, and the model check happens here rather than in `load`, so it
+// holds for every source the bytes came from.
+//
+// ```novo
+// use vsfile
+//
+// fn read(b: Bytes) -> Bool
+//     match vsfile.from_bytes(b)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn from_bytes(b: Bytes) -> Result<VsCollection, VsFault> []
+    todo("vectorstore-nv.vsfile.from_bytes")
+
+// The header a buffer starts with.
+//
+// `[]`.  Four hundred bytes answer what a caller usually wants to know
+// — is this the right model, how many documents, what dimension —
+// without materialising a hundred megabytes of vectors.
+//
+// ```novo
+// use vsfile
+//
+// fn peek(b: Bytes) -> Bool
+//     match vsfile.peek_header(b)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn peek_header(b: Bytes) -> Result<VsFileHeader, VsFault> []
+    todo("vectorstore-nv.vsfile.peek_header")
+
+// How large the file will be.
+//
+// `[]`.  For a caller checking free space before it writes, which
+// matters here because a collection of a million 768-dimension
+// vectors is three gigabytes and a half-written one is unreadable.
+//
+// ```novo
+// use vsfile
+//
+// fn room(c: VsCollection) -> Int
+//     match vsfile.size_bound(c)
+//         Ok(n)  => n
+//         Err(_) => 0
+// ```
+pub fn size_bound(c: VsCollection) -> Result<Int, VsFault> []
+    todo("vectorstore-nv.vsfile.size_bound")
+
+// Whether a buffer is a collection file.
+//
+// `[]`.
+//
+// ```novo
+// use vsfile
+//
+// fn is_one(b: Bytes) -> Bool
+//     vsfile.is_collection(b)
+// ```
+pub fn is_collection(b: Bytes) -> Bool []
+    todo("vectorstore-nv.vsfile.is_collection")
+
+// Write a collection to a path.
+//
+// `[fs]`.  Writes to a temporary name in the same directory and
+// renames over the target, so a process that died halfway leaves the
+// previous collection intact rather than a truncated file that
+// `load` will refuse.  A rename within a directory is the only atomic
+// operation a filesystem offers, and a store whose whole state is one
+// file should use it.
+//
+// ```novo ignore
+// use vsfile
+//
+// fn write(c: VsCollection, path: Str) -> Result<Int, VsFault> [fs]
+//     vsfile.save(c, path)
+// ```
+pub fn save(c: VsCollection, path: Str) -> Result<Int, VsFault> [fs]
+    todo("vectorstore-nv.vsfile.save")
+
+// Read a collection from a path.
+//
+// `[fs]`.
+//
+// ```novo ignore
+// use vsfile
+//
+// fn read(path: Str) -> Result<VsCollection, VsFault> [fs]
+//     vsfile.load(path)
+// ```
+pub fn load(path: Str) -> Result<VsCollection, VsFault> [fs]
+    todo("vectorstore-nv.vsfile.load")
+
+// A file's header, without reading the vectors.
+//
+// `[fs]`.  The call a program makes at start-up to decide whether the
+// collection on disk is the one it wants, before it spends the memory.
+//
+// ```novo ignore
+// use vsfile
+//
+// fn about(path: Str) -> Result<VsFileHeader, VsFault> [fs]
+//     vsfile.read_header(path)
+// ```
+pub fn read_header(path: Str) -> Result<VsFileHeader, VsFault> [fs]
+    todo("vectorstore-nv.vsfile.read_header")
+
+// Whether a path holds a collection this package can read.
+//
+// `[fs]`.  A question rather than a failed load, because a program
+// scanning a directory of files should not have to treat "not a
+// collection" as an error.
+//
+// ```novo ignore
+// use vsfile
+//
+// fn probe(path: Str) -> Bool [fs]
+//     vsfile.is_collection_file(path)
+// ```
+pub fn is_collection_file(path: Str) -> Bool [fs]
+    todo("vectorstore-nv.vsfile.is_collection_file")
+
+// A store backed by a file, loaded once and written on demand.
+//
+// The collection lives in memory; `flush` is what writes it.  There is
+// no write-through, and that is the honest shape for a format whose
+// unit of writing is the whole file: a store that wrote on every
+// upsert would rewrite three gigabytes per document.
+pub struct VsFileStore
+    memory: VsMemory
+    path: Str
+    // Whether the in-memory collection differs from the file.
+    dirty: Bool
+
+// Open a collection from a path, or create an empty one.
+//
+// `[fs]`.
+//
+// ```novo ignore
+// use vsfile
+//
+// fn open(path: Str, c: VsConfig) -> Result<VsFileStore, VsFault> [fs]
+//     vsfile.open(path, "notes", c)
+// ```
+pub fn open(path: Str, name: Str, config: VsConfig) -> Result<VsFileStore, VsFault> [fs]
+    todo("vectorstore-nv.vsfile.open")
+
+// Write the collection if it has changed.
+//
+// `[fs]`.  Answers whether it wrote, so a caller running this on a
+// timer can log only the writes that happened.
+//
+// ```novo ignore
+// use vsfile
+//
+// fn write(s: VsFileStore) -> Result<Bool, VsFault> [fs]
+//     vsfile.flush(s)
+// ```
+pub fn flush(s: VsFileStore) -> Result<Bool, VsFault> [fs]
+    todo("vectorstore-nv.vsfile.flush")
+
+// A file-backed store performs `[fs]`.
+//
+// Every method is `[fs]` rather than `[]`, even the ones that only
+// touch memory: a store that declared two different rows for its own
+// methods would make the trait's effect parameter meaningless, since a
+// caller binds one row for the whole store.
+//
+// ```novo ignore
+// use vsstore
+// use vsfile
+//
+// fn find(s: VsFileStore, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [fs]
+//     s.vs_search(q)
+// ```
+impl VsStore[fs] for VsFileStore
+    fn vs_upsert(self, docs: [VsDoc]) -> Result<Int, VsFault> [fs]
+        todo("vectorstore-nv.vsfile.VsFileStore.vs_upsert")
+
+    fn vs_delete(self, ids: [Str]) -> Result<Int, VsFault> [fs]
+        todo("vectorstore-nv.vsfile.VsFileStore.vs_delete")
+
+    fn vs_get(self, ids: [Str]) -> Result<[VsDoc], VsFault> [fs]
+        todo("vectorstore-nv.vsfile.VsFileStore.vs_get")
+
+    fn vs_search(self, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [fs]
+        todo("vectorstore-nv.vsfile.VsFileStore.vs_search")
+
+    fn vs_count(self) -> Result<Int, VsFault> [fs]
+        todo("vectorstore-nv.vsfile.VsFileStore.vs_count")

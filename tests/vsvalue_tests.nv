@@ -1,0 +1,389 @@
+// vsvalue_tests.nv — the filter language, the fusion, the collection
+// and the two remote dialects, with no socket and no file.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// vectorstore-nv.<module>.<fn>`.
+
+use std.test
+use std.json
+use std.list
+use hnswparam
+use vsbm25
+use vsdoc
+use vsfault
+use vsfile
+use vsfilter
+use vshttp
+use vsrank
+use vssearch
+
+fn a_config() -> VsConfig
+    vsdoc.config(2, HnswCosine, "test-model",
+                 hnswparam.default_params(2, HnswCosine)!)
+
+fn a_doc(id: Str, year: Int) -> VsDoc
+    vsdoc.with_metadata(vsdoc.doc(id, id, [0.1, 1.0]),
+                        json.object([("year", json.int(year))]))
+
+@test
+fn test_an_impossible_filter_is_not_an_empty_shelf() [io]
+    // "Your filter cannot match anything" and "nothing in the corpus
+    // matched" are different answers, and a store that gave the second
+    // for the first hides a bug in a query builder.
+    test.assert(vsfilter.is_satisfiable(VsNone) == false)
+    test.assert(vsfilter.is_satisfiable(VsAll))
+
+@test
+fn test_an_empty_conjunction_and_an_empty_disjunction_are_opposite_answers() [io]
+    // So a store that quietly picked one returns either the whole
+    // corpus or none of it.  Both are refused.
+    match vsfilter.check(vsfilter.all_of([]))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match vsfilter.check(vsfilter.any_of([]))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_comparison_between_two_types_is_refused_rather_than_false() [io]
+    // Both remote dialects answer false, which is indistinguishable
+    // from "no documents matched".
+    let f = vsfilter.is_clause(VsGt("year", VsStr("2020")))
+    let meta = json.object([("year", json.int(2021))])
+
+    match vsfilter.matches(f, meta)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_an_empty_in_list_matches_nothing_and_is_refused() [io]
+    match vsfilter.check(vsfilter.is_clause(VsIn("lang", [])))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_absent_and_null_are_two_states_with_two_clauses() [io]
+    let present = json.object([("year", json.int(2021))])
+    let nulled = json.object([("year", json.null())])
+
+    match vsfilter.matches(vsfilter.is_clause(VsExists("year")), present)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(b)
+
+    match vsfilter.matches(vsfilter.is_clause(VsMissing("year")), nulled)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(b)
+
+@test
+fn test_a_filter_names_its_fields_and_counts_its_clauses() [io]
+    let f = vsfilter.all_of([vsfilter.is_clause(VsEq("lang", VsStr("da"))),
+                             vsfilter.is_clause(VsGt("year", VsInt(2020)))])
+
+    test.assert(vsfilter.clause_count(f) == 2)
+    test.assert(list.len(vsfilter.fields_of(f)) == 2)
+
+@test
+fn test_simplifying_a_filter_is_published_because_a_person_reads_it() [io]
+    let f = vsfilter.all_of([VsAll, vsfilter.is_clause(VsEq("lang", VsStr("da")))])
+
+    test.assert(vsfilter.clause_count(vsfilter.simplify(f)) == 1)
+
+@test
+fn test_a_scalar_crosses_into_the_filter_language_and_back() [io]
+    match vsfilter.value_of(json.int(7))
+        None    => test.assert(false)
+        Some(v) => test.assert(json.type_of(vsfilter.value_json(v)) == "number")
+
+    test.case("an object is not a comparable value, in either dialect")
+    match vsfilter.value_of(json.object([]))
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+@test
+fn test_fusion_merges_ranks_and_has_nowhere_to_put_a_score() [io]
+    // A BM25 score and a cosine similarity are not on a scale.  The
+    // parameter's type is the argument.
+    let a = vsrank.ranking(["x", "y", "z"])
+    let b = vsrank.ranking(["y", "x"])
+
+    let fused = vsrank.fuse(vsrank.default_fusion(), [a, b])
+
+    test.case("three documents came out")
+    test.assert(list.len(fused) == 3)
+
+    match list.first(fused)
+        None    => test.assert(false)
+        Some(h) =>
+            test.case("and the one both lists ranked highly wins")
+            test.assert(vsrank.found_in(h) == 2)
+
+@test
+fn test_a_document_found_by_both_beats_one_found_first_by_only_one() [io]
+    // The property reciprocal rank fusion exists for.
+    let a = vsrank.ranking(["only_a", "both"])
+    let b = vsrank.ranking(["only_b", "both"])
+
+    match list.first(vsrank.fuse(vsrank.default_fusion(), [a, b]))
+        None    => test.assert(false)
+        Some(h) => test.assert(h.id == "both")
+
+@test
+fn test_the_constant_is_cormack_clarke_and_buettchers() [io]
+    // Named as theirs, so a port is checked rather than tuned.
+    test.assert(vsrank.default_fusion().k == 60)
+    test.assert(vsrank.contribution(vsrank.default_fusion(), 1, 1.0) > 0.0)
+
+@test
+fn test_weights_of_the_wrong_length_are_a_silent_misweighting() [io]
+    match vsrank.check(vsrank.fusion(60, [1.0]), 2)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_two_retrievers_that_agree_are_one_retriever() [io]
+    let a = vsrank.ranking(["x", "y"])
+    test.assert(vsrank.overlap(a, a, 2) == 1.0)
+
+@test
+fn test_hits_become_a_ranking_and_their_scores_do_not_come_with_them() [io]
+    let r = vsrank.of_hits([])
+    test.assert(list.len(r.ids) == 0)
+    test.assert(list.len(vsrank.take_k([], 10)) == 0)
+
+@test
+fn test_bm25_carries_robertson_and_walkers_numbers() [io]
+    let p = vsbm25.default_params()
+
+    test.assert(p.k1 == 1.2)
+    test.assert(p.b == 0.75)
+
+    test.case("and BM25+ is off, because a port is the thing it ports first")
+    test.assert(p.delta == 0.0)
+
+@test
+fn test_the_stop_word_list_is_empty_by_default() [io]
+    // Every list disagrees with every other, and dropping `not` from a
+    // corpus of requirements changes what the corpus says.
+    test.assert(list.len(vsbm25.tokenizer().stop_words) == 0)
+    test.assert(vsbm25.tokenizer().fold_case)
+
+@test
+fn test_tokens_are_unicode_word_boundaries_and_not_a_split_on_spaces() [io]
+    // An index that split on ASCII whitespace indexes a Japanese
+    // document as one enormous term and matches nothing.
+    let t = vsbm25.tokenizer()
+
+    test.assert(list.len(vsbm25.tokenize(t, "the capital of Denmark")) == 4)
+    test.assert(list.len(vsbm25.tokenize(t, "デンマークの首都")) > 1)
+
+@test
+fn test_an_unknown_term_is_named_rather_than_scoring_everything_zero() [io]
+    // "Why did my search return nothing" has three possible answers
+    // and an empty result distinguishes none of them.
+    let t = vsbm25.tokenizer()
+
+    match vsbm25.build(t, ["the capital of Denmark is Copenhagen"])
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(list.len(vsbm25.unknown_terms(ix, t, "kangaroo")) == 1)
+            test.assert(vsbm25.term_count(ix) > 0)
+            test.assert(vsbm25.average_length(ix) > 0.0)
+            test.assert(vsbm25.doc_frequency(ix, "copenhagen") == 1)
+            test.assert(vsbm25.idf(ix, "copenhagen") > 0.0)
+
+@test
+fn test_a_keyword_search_ranks_and_scores_separately() [io]
+    let t = vsbm25.tokenizer()
+    let p = vsbm25.default_params()
+
+    match vsbm25.build(t, ["denmark", "sweden"])
+        Err(_) => test.assert(false)
+        Ok(ix) =>
+            test.assert(list.len(vsbm25.score_all(ix, t, p, "denmark")) == 2)
+            test.assert(list.len(vsbm25.top_k(ix, t, p, "denmark", 1)) == 1)
+
+            match vsbm25.add(ix, t, "norway")
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(false)
+
+    test.assert(vsbm25.empty_index().total_len == 0)
+    test.assert(vsbm25.params(1.5, 0.75, 0.0).k1 == 1.5)
+    test.assert(list.len(vsbm25.with_stop_words(t, ["the"]).stop_words) == 1)
+
+@test
+fn test_a_vector_from_another_model_never_reaches_the_index() [io]
+    let c = vsdoc.collection("notes", a_config())
+
+    match vsdoc.upsert(c, a_doc("a", 2021), "another-model")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("nor one of the wrong length")
+    match vsdoc.check_vector(c, [0.1], "test-model")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_batch_says_what_it_replaced() [io]
+    // "I inserted a thousand" and "I inserted nine hundred and
+    // replaced a hundred" are different facts about a corpus.
+    let c = vsdoc.collection("notes", a_config())
+
+    match vsdoc.upsert_many(c, [a_doc("a", 2021), a_doc("a", 2022)], "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            test.assert(u.added == 1)
+            test.assert(list.len(u.replaced) == 1)
+
+@test
+fn test_a_delete_is_a_mark_and_the_space_is_reclaimed_by_compacting() [io]
+    // Worth knowing before somebody deletes personal data.
+    var c = vsdoc.collection("notes", a_config())
+    match vsdoc.upsert(c, a_doc("a", 2021), "test-model")
+        Ok(next) =>
+            c = next
+        Err(_)   => test.assert(false)
+
+    match vsdoc.delete(c, "a")
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            test.case("it is gone from the count")
+            test.assert(vsdoc.doc_count(next) == 0)
+
+            test.case("and still occupying a slot")
+            test.assert(vsdoc.deleted_count(next) == 1)
+
+            match vsdoc.compact(next, [0.5])
+                Ok(small) => test.assert(vsdoc.deleted_count(small) == 0)
+                Err(_)    => test.assert(false)
+
+@test
+fn test_documents_are_fetched_by_id_in_the_order_asked_for() [io]
+    var c = vsdoc.collection("notes", a_config())
+    match vsdoc.upsert_many(c, [a_doc("a", 2021), a_doc("b", 2022)], "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+
+    test.assert(list.len(vsdoc.get_many(c, ["b", "a", "missing"])) == 2)
+    test.assert(list.len(vsdoc.ids(c)) == 2)
+
+    match vsdoc.get(c, "a")
+        Some(_) => test.assert(true)
+        None    => test.assert(false)
+
+@test
+fn test_a_document_is_built_by_value() [io]
+    let d = vsdoc.with_vector(
+                vsdoc.with_metadata(vsdoc.doc("a", "text", []), json.object([])),
+                [0.1, 1.0])
+
+    test.assert(d.id == "a")
+    test.assert(list.len(d.vector) == 2)
+    test.assert(vsdoc.with_keyword_index(a_config()).keyword_index)
+
+@test
+fn test_the_file_format_is_bytes_and_the_filesystem_is_separate() [io]
+    // So a caller keeping collections in a database column, an object
+    // store or a zip entry never touches the `[fs]` row.
+    let c = vsdoc.collection("notes", a_config())
+
+    match vsfile.to_bytes(c)
+        Err(_) => test.assert(false)
+        Ok(b)  =>
+            test.assert(vsfile.is_collection(b))
+
+            match vsfile.peek_header(b)
+                Err(_) => test.assert(false)
+                Ok(h)  =>
+                    test.case("and the header records the model")
+                    test.assert(h.model == "test-model")
+                    test.assert(h.version == 1)
+
+            match vsfile.from_bytes(b)
+                Ok(_)  => test.assert(true)
+                Err(_) => test.assert(false)
+
+    match vsfile.size_bound(c)
+        Ok(n)  => test.assert(n > 0)
+        Err(_) => test.assert(false)
+
+    test.assert(list.len(vsfile.supported_versions()) >= 1)
+
+@test
+fn test_the_two_dialects_translate_the_same_filter_differently() [io]
+    let f = vsfilter.is_clause(VsGt("year", VsInt(2020)))
+
+    match vshttp.encode_filter(VsQdrant, f)
+        Ok(v)  => test.assert(json.type_of(v) == "object")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, f)
+        Ok(v)  => test.assert(json.type_of(v) == "object")
+        Err(_) => test.assert(false)
+
+@test
+fn test_chroma_has_no_sparse_vectors_and_says_so_by_name() [io]
+    // Rather than a vector search that quietly dropped its keyword
+    // half.
+    let q = vssearch.hybrid_query([0.1, 1.0], "denmark", 10)
+
+    match vshttp.check_query(VsChroma, q)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_string_id_becomes_a_stable_point_id_and_the_original_travels() [io]
+    // qdrant accepts an unsigned integer or a UUID and nothing else.
+    let a = vshttp.point_id(VsQdrant, "docs/intro.md")
+    let b = vshttp.point_id(VsQdrant, "docs/intro.md")
+
+    test.assert(a == b)
+    test.assert(vshttp.point_id(VsChroma, "docs/intro.md") == "docs/intro.md")
+
+@test
+fn test_a_remote_client_is_built_by_value() [io]
+    let c = vshttp.with_model(
+                vshttp.with_header(vshttp.qdrant("http://localhost:6333", "notes"),
+                                   "api-key", "secret"),
+                "test-model")
+
+    test.assert(c.collection == "notes")
+    test.assert(list.len(c.headers) == 1)
+    test.assert(c.model == "test-model")
+    test.assert(vshttp.dialect_name(c.dialect) == "qdrant")
+    test.assert(vshttp.search_path(c) != "")
+    test.assert(vshttp.upsert_path(c) != "")
+
+    match vshttp.dialect_of_name("chroma")
+        Some(d) => test.assert(vshttp.dialect_name(d) == "chroma")
+        None    => test.assert(false)
+
+@test
+fn test_a_remote_answer_is_read_without_a_socket() [io]
+    let c = vshttp.chroma("http://localhost:8000", "notes")
+
+    match vshttp.encode_search(c, vssearch.query([0.1, 1.0], 10))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_upsert(c, [a_doc("a", 2021)])
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    match vshttp.decode_search(c, "{\"ids\":[[]],\"distances\":[[]]}")
+        Ok(o)  => test.assert(o.exhaustive == false)
+        Err(_) => test.assert(true)
+
+    match vshttp.decode_get(c, "{\"ids\":[]}")
+        Ok(ds) => test.assert(list.len(ds) == 0)
+        Err(_) => test.assert(true)
+
+    test.assert(vsfault.is_retryable(vshttp.decode_error(VsChroma, 503, "")))
+
+@test
+fn test_a_fault_says_whether_it_is_the_callers_own() [io]
+    test.assert(vsfault.is_caller_error(VsDimMismatch(768, 384)))
+    test.assert(vsfault.is_retryable(VsNoSuchDoc("a")) == false)

@@ -1,0 +1,215 @@
+// vsrank.nv — merging two rankings, and why it is done by rank.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.
+//
+// **RECIPROCAL RANK FUSION MERGES RANKS, NOT SCORES, AND THAT IS THE
+// WHOLE POINT.**  A BM25 score is an unbounded sum of per-term weights
+// over a particular corpus — 14.2 is a big number for one index and a
+// small one for another, and adding a document to the corpus changes
+// every score in it.  A cosine similarity is in [-1, 1] and means the
+// same thing everywhere.  The two numbers are not on a scale; there is
+// no exchange rate between them.
+//
+// So every `alpha * vector_score + (1 - alpha) * keyword_score` a
+// retrieval pipeline contains is arithmetic on incomparable units, and
+// it works exactly as well as the normalisation somebody guessed at —
+// which is why tuning `alpha` feels like it never converges.  The
+// usual repair, min-max normalising each result set, is worse in a
+// specific way: it makes the top score 1 and the bottom 0 in EVERY
+// result set, so a query where the keyword half found nothing relevant
+// still contributes a full-strength 1.0 at the top.
+//
+// RANKS ARE COMPARABLE.  First is first in both lists.  RRF scores a
+// document as the sum of `1 / (k + rank)` across the lists that found
+// it, and that is it: no normalisation, no weights to tune, no corpus
+// dependence, and a document found second and third beats one found
+// first and nowhere.  Cormack, Clarke and Buettcher's `k` of 60 is the
+// default and is named as theirs.
+//
+// THE COST IS STATED TOO: fusing by rank throws away the MARGIN.  A
+// vector search whose top hit is far ahead of its second and one whose
+// top ten are indistinguishable produce the same ranks, so RRF cannot
+// tell a confident retrieval from a flat one.  `weights` is the escape
+// for a caller who has measured their own corpus, and
+// `VsSource.VsFromBoth` is what an explanation shows instead.
+
+use std.list
+
+// How two rankings are merged.
+pub struct VsFusion
+    // RRF's constant.  60 is Cormack, Clarke and Buettcher's own, and
+    // it is a DAMPING term: a larger k flattens the difference between
+    // rank 1 and rank 10, a smaller one sharpens it.
+    k: Int
+    // Per-list multipliers, in the order the lists are given.  All
+    // 1.0 is plain RRF and the default.  A weight is the one honest
+    // knob here, because it scales a term that is already on a common
+    // scale — unlike a weight over raw scores, which scales one that
+    // is not.
+    weights: [Float]
+
+// Cormack, Clarke and Buettcher's numbers: k of 60, equal weights.
+//
+// ```novo
+// use vsrank
+//
+// fn main() [io]
+//     println("${vsrank.default_fusion().k}")
+//     // : 60
+// ```
+pub fn default_fusion() -> VsFusion []
+    todo("vectorstore-nv.vsrank.default_fusion")
+
+// Fusion with a constant and weights of the caller's own.
+//
+// ```novo
+// use vsrank
+//
+// fn main() [io]
+//     println("${vsrank.fusion(10, [1.0, 0.5]).k}")
+//     // : 10
+// ```
+pub fn fusion(k: Int, weights: [Float]) -> VsFusion []
+    todo("vectorstore-nv.vsrank.fusion")
+
+// One ranked list, as ids in order.
+//
+// IDS AND NOT SCORES, which is the module's argument made into a type:
+// a caller cannot hand this function a score it wanted fused, because
+// the parameter has nowhere to put one.
+pub struct VsRanking
+    ids: [Str]
+
+// A ranking from a list of ids.
+//
+// ```novo
+// use vsrank
+//
+// fn main() [io]
+//     println("${list.len(vsrank.ranking(["a", "b"]).ids)}")
+//     // : 2
+// ```
+pub fn ranking(ids: [Str]) -> VsRanking []
+    todo("vectorstore-nv.vsrank.ranking")
+
+// Fuse many rankings into one.
+//
+// The RRF score of a document is the sum of `weight / (k + rank)` over
+// the lists that contain it, with rank counted from 1.  Ties break by
+// the document's position in the FIRST list that contains it, and then
+// by id — because a ranking that changes order between two runs over
+// the same data is one nobody can test.
+//
+// ```novo
+// use vsrank
+//
+// fn merged(a: VsRanking, b: VsRanking) -> Int
+//     list.len(vsrank.fuse(vsrank.default_fusion(), [a, b]))
+// ```
+pub fn fuse(f: VsFusion, rankings: [VsRanking]) -> [VsFusedHit] []
+    todo("vectorstore-nv.vsrank.fuse")
+
+// One fused result.
+pub struct VsFusedHit
+    id: Str
+    // The RRF score.  A number whose only meaning is the order it
+    // produces: it is not a similarity, not a probability and not
+    // comparable between queries.  Published because a caller
+    // debugging a ranking needs to see it, and documented as
+    // meaningless so nobody thresholds on it.
+    score: Float
+    // The rank this document held in each input list, -1 where it was
+    // absent.  What an explanation shows, and what makes "found by
+    // both" visible.
+    ranks: [Int]
+
+// The RRF contribution of one rank.
+//
+// `weight / (k + rank)`.  Published so a test asserts the formula
+// rather than a fused order that could come out right by accident.
+//
+// ```novo
+// use vsrank
+//
+// fn main() [io]
+//     println("${vsrank.contribution(vsrank.default_fusion(), 1, 1.0) > 0.0}")
+//     // : true
+// ```
+pub fn contribution(f: VsFusion, rank: Int, weight: Float) -> Float []
+    todo("vectorstore-nv.vsrank.contribution")
+
+// In how many of the input lists a fused hit appeared.
+//
+// The signal RRF rewards, named so a caller can show it: a document
+// both retrievers found is a different kind of answer from one only
+// the keyword half found, and the score alone does not say which.
+//
+// ```novo
+// use vsrank
+//
+// fn agreed(h: VsFusedHit) -> Int
+//     vsrank.found_in(h)
+// ```
+pub fn found_in(h: VsFusedHit) -> Int []
+    todo("vectorstore-nv.vsrank.found_in")
+
+// The first `k` of a fused list.
+//
+// ```novo
+// use vsrank
+//
+// fn page(hs: [VsFusedHit]) -> Int
+//     list.len(vsrank.take_k(hs, 10))
+// ```
+pub fn take_k(hits: [VsFusedHit], k: Int) -> [VsFusedHit] []
+    todo("vectorstore-nv.vsrank.take_k")
+
+// A ranking from search hits, discarding their scores.
+//
+// The conversion `vssearch` makes before fusing, and it is one-way on
+// purpose: once two result sets are rankings, there is no score left
+// to be tempted into adding.
+//
+// ```novo
+// use vsrank
+//
+// fn as_ranking(hs: [VsHit]) -> Int
+//     list.len(vsrank.of_hits(hs).ids)
+// ```
+pub fn of_hits(hits: [VsHit]) -> VsRanking []
+    todo("vectorstore-nv.vsrank.of_hits")
+
+// Whether a fusion's weights fit the number of lists it will merge.
+//
+// A weight list of the wrong length is a silent misweighting — the
+// extra lists get 1.0, or the extra weights are ignored — so it is
+// refused.
+//
+// ```novo
+// use vsrank
+//
+// fn ok(f: VsFusion) -> Bool
+//     match vsrank.check(f, 2)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn check(f: VsFusion, list_count: Int) -> Result<Int, VsFault> []
+    todo("vectorstore-nv.vsrank.check")
+
+// How much two rankings agree, as the fraction of the first k they
+// share.
+//
+// For deciding whether a hybrid search is worth its second retriever
+// at all: two rankings that agree on nine of ten are two retrievers
+// doing one job, and the keyword half can be dropped.
+//
+// ```novo
+// use vsrank
+//
+// fn same(a: VsRanking, b: VsRanking) -> Float
+//     vsrank.overlap(a, b, 10)
+// ```
+pub fn overlap(a: VsRanking, b: VsRanking, k: Int) -> Float []
+    todo("vectorstore-nv.vsrank.overlap")

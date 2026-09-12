@@ -1,0 +1,378 @@
+// vshttp.nv — the qdrant and chroma dialects, behind the same trait.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[net]` on the store's methods; the request and response shapes are
+// `[]` and published, so a caller with its own HTTP client uses this
+// module's codecs without its transport.
+//
+// TWO SERVERS, ONE TRAIT, AND THE DIFFERENCES SAID OUT LOUD.  A
+// wrapper that made them look identical would make them look identical
+// right up to the point where they are not, so this module's job is
+// half translation and half disclosure:
+//
+//   A DOCUMENT ID IS NOT THE SAME THING.  qdrant's point id is an
+//   unsigned integer or a UUID and nothing else; chroma's is any
+//   string.  `VsDoc.id` is a `Str`, so `qdrant_point_id` hashes a
+//   non-UUID id into a stable UUID and keeps the original in the
+//   payload — which means a qdrant collection written by this package
+//   has an `id` field in every payload, and a caller reading that
+//   collection with another client needs to know.
+//
+//   A FILTER'S SEMANTICS ARE THE SERVER'S.  `vsfilter.matches` is this
+//   package's definition; each translation is tested against it, and
+//   the three places they disagree are named in the README rather than
+//   hidden — a missing field, a type mismatch, and an empty `in`.
+//
+//   NEITHER SERVER REPORTS WHETHER A FILTERED SEARCH WAS EXHAUSTIVE.
+//   So `VsSearchOutcome.exhaustive` is FALSE for every filtered remote
+//   query.  That is a loss of information rather than a defect, and a
+//   caller that needs the guarantee runs the query against a local
+//   collection.
+//
+//   CHROMA HAS NO SPARSE VECTORS.  A hybrid query against it is
+//   `VsUnsupportedQuery` naming the server, not a vector search that
+//   quietly dropped its keyword half.
+
+use std.json
+
+// Which server dialect a client speaks.
+pub enum VsDialect
+    // qdrant's REST API: `PUT /collections/{c}/points`,
+    // `POST /collections/{c}/points/search`, a `filter` of `must` /
+    // `should` / `must_not` clauses.
+    VsQdrant
+    // chroma's API: `POST /api/v1/collections/{id}/add` and `/query`,
+    // a `where` object of MongoDB-shaped operators.
+    VsChroma
+
+// The name in a configuration file.
+//
+// ```novo
+// use vshttp
+//
+// fn main() [io]
+//     println(vshttp.dialect_name(VsQdrant))
+//     // : qdrant
+// ```
+pub fn dialect_name(d: VsDialect) -> Str []
+    todo("vectorstore-nv.vshttp.dialect_name")
+
+// The dialect a name selects.
+//
+// ```novo
+// use vshttp
+//
+// fn main() [io]
+//     match vshttp.dialect_of_name("chroma")
+//         Some(d) => println(vshttp.dialect_name(d))
+//         None    => println("unknown")
+//     // : chroma
+// ```
+pub fn dialect_of_name(name: Str) -> ?VsDialect []
+    todo("vectorstore-nv.vshttp.dialect_of_name")
+
+// A remote store.
+pub struct VsHttp
+    dialect: VsDialect
+    base_url: Str
+    // The collection's name (qdrant) or id (chroma).
+    collection: Str
+    // `Name: value` lines added to every request — an API key, a
+    // tenant header.  A list rather than a key field, because the two
+    // servers name their key header differently and a gateway in front
+    // of either wants its own.
+    headers: [Str]
+    // The embedding model this collection was built with, checked
+    // against a query's before a request is sent.  The server does not
+    // know it; this package does, and it is the check that costs
+    // nothing and catches the failure nothing else catches.
+    model: Str
+
+// A qdrant client.
+//
+// ```novo
+// use vshttp
+//
+// fn main() [io]
+//     println(vshttp.qdrant("http://localhost:6333", "notes").collection)
+//     // : notes
+// ```
+pub fn qdrant(base_url: Str, collection: Str) -> VsHttp []
+    todo("vectorstore-nv.vshttp.qdrant")
+
+// A chroma client.
+//
+// ```novo
+// use vshttp
+//
+// fn main() [io]
+//     println(vshttp.dialect_name(vshttp.chroma("http://localhost:8000", "notes").dialect))
+//     // : chroma
+// ```
+pub fn chroma(base_url: Str, collection: Str) -> VsHttp []
+    todo("vectorstore-nv.vshttp.chroma")
+
+// The same client with one more header.
+//
+// ```novo
+// use vshttp
+//
+// fn keyed(c: VsHttp) -> VsHttp
+//     vshttp.with_header(c, "api-key", "secret")
+// ```
+pub fn with_header(c: VsHttp, name: Str, value: Str) -> VsHttp []
+    todo("vectorstore-nv.vshttp.with_header")
+
+// The same client asserting which embedding model the collection
+// holds.
+//
+// ```novo
+// use vshttp
+//
+// fn checked(c: VsHttp) -> VsHttp
+//     vshttp.with_model(c, "text-embedding-3-small")
+// ```
+pub fn with_model(c: VsHttp, model: Str) -> VsHttp []
+    todo("vectorstore-nv.vshttp.with_model")
+
+// A filter in the dialect's own spelling.
+//
+// `[]`.  **THE FUNCTION THIS MODULE IS TESTED ON**: the same filter and
+// the same document go through `vsfilter.matches` and through each
+// translation, and the three places a server's answer differs from
+// this package's are named rather than discovered.
+//
+// ```novo
+// use vshttp
+// use vsfilter
+// use std.json
+//
+// fn main() [io]
+//     match vshttp.encode_filter(VsQdrant, VsAll)
+//         Ok(v)  => println(json.type_of(v))
+//         Err(_) => println("refused")
+//     // : object
+// ```
+pub fn encode_filter(d: VsDialect, f: VsFilter) -> Result<JsonValueH, VsFault> []
+    todo("vectorstore-nv.vshttp.encode_filter")
+
+// A search request body in the dialect's own spelling.
+//
+// `[]`.
+//
+// ```novo
+// use vshttp
+//
+// fn body(c: VsHttp, q: VsQuery) -> Bool
+//     match vshttp.encode_search(c, q)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_search(c: VsHttp, q: VsQuery) -> Result<JsonValueH, VsFault> []
+    todo("vectorstore-nv.vshttp.encode_search")
+
+// An upsert request body.
+//
+// `[]`.
+//
+// ```novo
+// use vshttp
+//
+// fn body(c: VsHttp, ds: [VsDoc]) -> Bool
+//     match vshttp.encode_upsert(c, ds)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn encode_upsert(c: VsHttp, docs: [VsDoc]) -> Result<JsonValueH, VsFault> []
+    todo("vectorstore-nv.vshttp.encode_upsert")
+
+// A search response as hits.
+//
+// `[]`.  Normalises the score direction: qdrant answers a similarity
+// for cosine and a distance for euclidean, chroma answers a distance
+// always, and `VsHit.score` is a similarity in both cases.  Getting
+// this wrong is a store that returns the furthest documents and looks
+// like it works.
+//
+// ```novo
+// use vshttp
+//
+// fn read(c: VsHttp, body: Str) -> Bool
+//     match vshttp.decode_search(c, body)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode_search(c: VsHttp, body: Str) -> Result<VsSearchOutcome, VsFault> []
+    todo("vectorstore-nv.vshttp.decode_search")
+
+// A get response as documents.
+//
+// `[]`.
+//
+// ```novo
+// use vshttp
+//
+// fn read(c: VsHttp, body: Str) -> Bool
+//     match vshttp.decode_get(c, body)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn decode_get(c: VsHttp, body: Str) -> Result<[VsDoc], VsFault> []
+    todo("vectorstore-nv.vshttp.decode_get")
+
+// A non-2xx status and body as a fault.
+//
+// `[]`.  Reads each dialect's own error shape into `VsRemoteFailed`.
+//
+// ```novo
+// use vshttp
+// use vsfault
+//
+// fn main() [io]
+//     println("${vsfault.is_retryable(vshttp.decode_error(VsQdrant, 503, ""))}")
+//     // : true
+// ```
+pub fn decode_error(d: VsDialect, status: Int, body: Str) -> VsFault []
+    todo("vectorstore-nv.vshttp.decode_error")
+
+// The path a request goes to.
+//
+// `[]`, and published so a caller driving its own client never writes
+// one.
+//
+// ```novo
+// use vshttp
+//
+// fn path(c: VsHttp) -> Str
+//     vshttp.search_path(c)
+// ```
+pub fn search_path(c: VsHttp) -> Str []
+    todo("vectorstore-nv.vshttp.search_path")
+
+// The upsert path.
+//
+// ```novo
+// use vshttp
+//
+// fn path(c: VsHttp) -> Str
+//     vshttp.upsert_path(c)
+// ```
+pub fn upsert_path(c: VsHttp) -> Str []
+    todo("vectorstore-nv.vshttp.upsert_path")
+
+// The id this document will have on the server.
+//
+// `[]`.  qdrant accepts an unsigned integer or a UUID and nothing
+// else, so a `Str` id that is neither is hashed into a stable UUID and
+// the original travels in the payload under `id`.  Published because
+// the consequence is visible from outside: a collection this package
+// wrote has an `id` payload field another client has to read.
+//
+// ```novo
+// use vshttp
+//
+// fn on_server(d: VsDialect, id: Str) -> Str
+//     vshttp.point_id(d, id)
+// ```
+pub fn point_id(d: VsDialect, id: Str) -> Str []
+    todo("vectorstore-nv.vshttp.point_id")
+
+// Whether a dialect can answer this query.
+//
+// `[]`.  chroma has no sparse vectors, so a hybrid query against it is
+// refused by NAME rather than quietly becoming a vector search.
+//
+// ```novo
+// use vshttp
+//
+// fn ok(d: VsDialect, q: VsQuery) -> Bool
+//     match vshttp.check_query(d, q)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn check_query(d: VsDialect, q: VsQuery) -> Result<Int, VsFault> []
+    todo("vectorstore-nv.vshttp.check_query")
+
+// Page through every document in a remote collection.
+//
+// `[net]`.  The remote answer to `vsstore.snapshot`, and named
+// differently because it is a different thing: downloading a corpus,
+// one page at a time, over a network.  `cursor` is the server's own —
+// qdrant's `next_page_offset`, chroma's offset — and empty starts.
+//
+// ```novo ignore
+// use vshttp
+//
+// fn page(c: VsHttp) -> Result<VsPage, VsFault> [net]
+//     vshttp.scroll(c, "", 256)
+// ```
+pub fn scroll(c: VsHttp, cursor: Str, limit: Int) -> Result<VsPage, VsFault> [net]
+    todo("vectorstore-nv.vshttp.scroll")
+
+// One page of a scroll.
+pub struct VsPage
+    docs: [VsDoc]
+    // The cursor for the next page, or empty at the end.
+    next: Str
+
+// Whether the server is reachable and the collection exists.
+//
+// `[net]`.  Published because the two most common deployment failures
+// — nothing listening, and a collection name that does not exist — are
+// otherwise a 404 inside a search, which reads like an empty result.
+//
+// ```novo ignore
+// use vshttp
+//
+// fn up(c: VsHttp) -> Result<Bool, VsFault> [net]
+//     vshttp.health(c)
+// ```
+pub fn health(c: VsHttp) -> Result<Bool, VsFault> [net]
+    todo("vectorstore-nv.vshttp.health")
+
+// Create the collection on the server if it is not there.
+//
+// `[net]`.  Takes the config so the dimension and the metric are the
+// ones this package would have used locally — a collection created by
+// hand with the wrong metric answers plausible nonsense.
+//
+// ```novo ignore
+// use vshttp
+//
+// fn make(c: VsHttp, cfg: VsConfig) -> Result<Bool, VsFault> [net]
+//     vshttp.ensure_collection(c, cfg)
+// ```
+pub fn ensure_collection(c: VsHttp, config: VsConfig) -> Result<Bool, VsFault> [net]
+    todo("vectorstore-nv.vshttp.ensure_collection")
+
+// A remote store performs `[net]`.
+//
+// Not `[io, net, time, async]`: the requests go through
+// llm-client-nv's narrow transport shape over `std.tls`, which is
+// `std.tls`'s own row.  A caller that wants the standard library's
+// HTTP client instead drives `encode_search` and `decode_search`
+// itself, which is why both are published.
+//
+// ```novo ignore
+// use vsstore
+// use vshttp
+//
+// fn find(s: VsHttp, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [net]
+//     s.vs_search(q)
+// ```
+impl VsStore[net] for VsHttp
+    fn vs_upsert(self, docs: [VsDoc]) -> Result<Int, VsFault> [net]
+        todo("vectorstore-nv.vshttp.VsHttp.vs_upsert")
+
+    fn vs_delete(self, ids: [Str]) -> Result<Int, VsFault> [net]
+        todo("vectorstore-nv.vshttp.VsHttp.vs_delete")
+
+    fn vs_get(self, ids: [Str]) -> Result<[VsDoc], VsFault> [net]
+        todo("vectorstore-nv.vshttp.VsHttp.vs_get")
+
+    fn vs_search(self, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [net]
+        todo("vectorstore-nv.vshttp.VsHttp.vs_search")
+
+    fn vs_count(self) -> Result<Int, VsFault> [net]
+        todo("vectorstore-nv.vshttp.VsHttp.vs_count")

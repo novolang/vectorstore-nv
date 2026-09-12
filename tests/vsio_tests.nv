@@ -1,0 +1,109 @@
+// vsio_tests.nv — the two modules that perform anything.
+//
+// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
+// assertion here reaches `not implemented:
+// vectorstore-nv.<module>.<fn>`.
+//
+// THE ONLY FILE IN THE PACKAGE WITH AN EFFECT ROW ON IT, and that is
+// the layer design working: `[fs]` for the six file calls, `[net]` for
+// the three remote ones, and nothing anywhere else.  The paths are
+// under `_novo/`, which the package does not track.
+
+use std.test
+use hnswparam
+use vsdoc
+use vsfault
+use vsfile
+use vshttp
+
+fn a_config() -> VsConfig
+    vsdoc.config(2, HnswCosine, "test-model",
+                 hnswparam.default_params(2, HnswCosine)!)
+
+fn a_path() -> Str
+    "_novo/vsio_test.nvvs"
+
+@test
+fn test_a_collection_goes_to_a_path_and_comes_back() [io, fs]
+    let c = vsdoc.collection("notes", a_config())
+
+    match vsfile.save(c, a_path())
+        Err(_) => test.assert(false)
+        Ok(n)  =>
+            test.case("the whole collection was written")
+            test.assert(n > 0)
+
+            match vsfile.load(a_path())
+                Err(_)   => test.assert(false)
+                Ok(back) => test.assert(vsdoc.doc_count(back) == 0)
+
+@test
+fn test_a_header_is_read_without_the_vectors() [io, fs]
+    // The call a program makes at start-up to decide whether the
+    // collection on disk is the one it wants, before it spends the
+    // memory.
+    let c = vsdoc.collection("notes", a_config())
+
+    match vsfile.save(c, a_path())
+        Err(_) => test.assert(false)
+        Ok(_)  =>
+            match vsfile.read_header(a_path())
+                Err(_) => test.assert(false)
+                Ok(h)  =>
+                    test.case("and it names the embedding model")
+                    test.assert(h.model == "test-model")
+
+@test
+fn test_a_path_is_asked_about_rather_than_loaded_and_caught() [io, fs]
+    // A program scanning a directory should not treat "not a
+    // collection" as an error.
+    test.assert(vsfile.is_collection_file("_novo/not-a-collection") == false)
+
+@test
+fn test_a_file_backed_store_holds_its_collection_in_memory_until_flushed() [io, fs]
+    // There is no write-through: the unit of writing is the whole
+    // file, so a store that wrote on every upsert would rewrite
+    // gigabytes per document.
+    match vsfile.open(a_path(), "notes", a_config())
+        Err(_) => test.assert(false)
+        Ok(s)  =>
+            test.case("nothing is pending on a fresh open")
+            test.assert(s.dirty == false)
+
+            match vsfile.flush(s)
+                Err(_)    => test.assert(false)
+                Ok(wrote) =>
+                    test.case("and flushing a clean store writes nothing")
+                    test.assert(wrote == false)
+
+@test
+fn test_a_server_that_is_not_there_is_a_fault_and_not_a_panic() [io, net]
+    // Nothing listening, and a collection name that does not exist,
+    // are the two most common deployment failures — and both otherwise
+    // arrive as a 404 inside a search, which reads like an empty
+    // result.
+    let c = vshttp.qdrant("http://127.0.0.1:1", "notes")
+
+    match vshttp.health(c)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(vsfault.is_retryable(f))
+
+@test
+fn test_a_collection_is_created_with_the_config_this_package_would_have_used() [io, net]
+    // A collection created by hand with the wrong metric answers
+    // plausible nonsense.
+    let c = vshttp.chroma("http://127.0.0.1:1", "notes")
+
+    match vshttp.ensure_collection(c, a_config())
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_downloading_a_corpus_is_named_differently_from_a_snapshot() [io, net]
+    // Because it is a different thing: one page at a time, over a
+    // network.
+    let c = vshttp.qdrant("http://127.0.0.1:1", "notes")
+
+    match vshttp.scroll(c, "", 256)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)

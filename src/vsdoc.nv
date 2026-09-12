@@ -1,0 +1,337 @@
+// vsdoc.nv — a document, and the collection it lives in.
+//
+// Every body here is a `todo()`; the signatures are the design.
+//
+// `[]` throughout.  A collection is a VALUE: every call takes one and
+// returns one, the same rule hnsw-nv's index follows and for the same
+// reason — a build is then a pure function of its inputs, and two
+// machines that ingested the same documents in the same order hold the
+// same collection.
+//
+// A DOCUMENT CARRIES ITS OWN VECTOR AND THIS PACKAGE EMBEDS NOTHING.
+// Embedding is a model call — a socket to a hosted API or a local
+// server, or an in-process forward pass — and a store that did it
+// would have taken `[net]` on every insert and picked the caller's
+// model for them.  So `VsDoc.vector` is a `[Float]` the caller
+// supplies, and the seam is one line: llm-client-nv or ollama-nv
+// produces the vector, `ndfloat.to_list` converts one that came from
+// embeddings-nv's matrix arithmetic, and this takes it from there.
+//
+// THE COLLECTION RECORDS THE MODEL IT WAS BUILT WITH, and that field
+// is the package's cheapest and most useful check.  Two embedding
+// models of the same dimension are two different spaces: querying a
+// collection built with one using a vector from the other produces
+// distances that are arithmetic, plausible and meaningless, and every
+// document comes back in an order that has nothing to do with the
+// query.  Nothing else in a retrieval pipeline catches it — the
+// results look like results — so `VsModelMismatch` is refused at
+// `upsert` and at `search`.
+
+use std.json
+use std.list
+
+// One document.
+pub struct VsDoc
+    // The caller's own identifier.  A `Str` because that is what every
+    // source of documents already has — a URL, a path, a primary key —
+    // and an integer surrogate would have made a caller keep a second
+    // table to map back.
+    id: Str
+    // The text this document is.  Kept because retrieval answers
+    // documents rather than row numbers, and because BM25 needs it.
+    text: Str
+    // Anything the caller wants to filter on, as the standard
+    // library's JSON value.  A `JsonValueH` rather than a typed map,
+    // because the fields differ per corpus and a store that fixed them
+    // would be a store nobody's documents fit.
+    metadata: JsonValueH
+    // The embedding.  Empty for a document in a keyword-only
+    // collection.
+    vector: [Float]
+
+// A document with text and no metadata.
+//
+// ```novo
+// use vsdoc
+//
+// fn main() [io]
+//     println(vsdoc.doc("a", "the capital of Denmark", []).id)
+//     // : a
+// ```
+pub fn doc(id: Str, text: Str, vector: [Float]) -> VsDoc []
+    todo("vectorstore-nv.vsdoc.doc")
+
+// The same document with metadata.
+//
+// ```novo
+// use vsdoc
+// use std.json
+//
+// fn main() [io]
+//     let d = vsdoc.with_metadata(vsdoc.doc("a", "text", []), json.object([]))
+//     println(json.type_of(d.metadata))
+//     // : object
+// ```
+pub fn with_metadata(d: VsDoc, metadata: JsonValueH) -> VsDoc []
+    todo("vectorstore-nv.vsdoc.with_metadata")
+
+// The same document with a vector.
+//
+// ```novo
+// use vsdoc
+//
+// fn main() [io]
+//     println("${list.len(vsdoc.with_vector(vsdoc.doc("a", "t", []), [0.1, 0.2]).vector)}")
+//     // : 2
+// ```
+pub fn with_vector(d: VsDoc, vector: [Float]) -> VsDoc []
+    todo("vectorstore-nv.vsdoc.with_vector")
+
+// How a collection is configured.
+pub struct VsConfig
+    // The vector dimension.  Zero for a keyword-only collection.
+    dim: Int
+    // hnsw-nv's metric.  `HnswCosine` is what almost every text
+    // embedding wants, and `wants_normalized` is the question to ask
+    // before inserting.
+    metric: HnswMetric
+    // **THE NAME OF THE MODEL THE VECTORS CAME FROM.**  Free text the
+    // caller chooses — `text-embedding-3-small`, `nomic-embed-text` —
+    // and compared for equality, nothing more.  It exists because two
+    // models of the same dimension are two spaces, and mixing them is
+    // the one retrieval defect that produces confident nonsense with
+    // no error anywhere.
+    model: Str
+    // Whether the collection keeps a BM25 index beside the vectors.
+    // False makes `vsbm25` unavailable on it and `VsUnsupportedQuery`
+    // the answer to a hybrid search, which is better than a hybrid
+    // search that quietly becomes a vector search.
+    keyword_index: Bool
+    // hnsw-nv's build parameters.
+    params: HnswParams
+
+// A configuration for a vector collection.
+//
+// ```novo
+// use vsdoc
+// use hnswparam
+//
+// fn config(p: HnswParams) -> VsConfig
+//     vsdoc.config(768, HnswCosine, "text-embedding-3-small", p)
+// ```
+pub fn config(dim: Int, metric: HnswMetric, model: Str, params: HnswParams) -> VsConfig []
+    todo("vectorstore-nv.vsdoc.config")
+
+// The same configuration with a keyword index.
+//
+// ```novo
+// use vsdoc
+//
+// fn with_bm25(c: VsConfig) -> VsConfig
+//     vsdoc.with_keyword_index(c)
+// ```
+pub fn with_keyword_index(c: VsConfig) -> VsConfig []
+    todo("vectorstore-nv.vsdoc.with_keyword_index")
+
+// A collection: the documents, the index over them, and the
+// configuration both were built under.
+//
+// A VALUE.  `upsert` takes one and returns one, so a caller's own
+// binding is the storage and a snapshot is a copy of a value rather
+// than a lock over a mutable one.
+pub struct VsCollection
+    name: Str
+    config: VsConfig
+    docs: [VsDoc]
+    index: HnswIndex
+    // The BM25 state, when `config.keyword_index` is true.
+    keywords: VsKeywordIndex
+    // Ids marked deleted but still occupying an index slot.  hnsw-nv
+    // deletes by marking, as hnswlib does, so a collection with heavy
+    // turnover grows until `compact`.
+    deleted: [Str]
+
+// The BM25 index over a collection's text.
+//
+// Opaque: the fields are here because a struct needs them, and a
+// caller that reaches into one has coupled itself to a decision
+// `vsbm25` intends to change.
+pub struct VsKeywordIndex
+    terms: [Str]
+    doc_freq: [Int]
+    postings: [[Int]]
+    doc_len: [Int]
+    total_len: Int
+
+// An empty collection.
+//
+// ```novo
+// use vsdoc
+//
+// fn empty(c: VsConfig) -> VsCollection
+//     vsdoc.collection("notes", c)
+// ```
+pub fn collection(name: Str, config: VsConfig) -> VsCollection []
+    todo("vectorstore-nv.vsdoc.collection")
+
+// Insert or replace one document.
+//
+// Refuses a vector of the wrong length, a vector whose model is not
+// the collection's, and a coordinate that is not finite — all three
+// before the index is touched, because all three are silent
+// afterwards.  `model` is the caller's claim about where the vector
+// came from; an empty one skips the check and says so by being empty.
+//
+// ```novo
+// use vsdoc
+//
+// fn add(c: VsCollection, d: VsDoc) -> Bool
+//     match vsdoc.upsert(c, d, "text-embedding-3-small")
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn upsert(c: VsCollection, d: VsDoc, model: Str) -> Result<VsCollection, VsFault> []
+    todo("vectorstore-nv.vsdoc.upsert")
+
+// Insert or replace many, in order.
+//
+// Answers the collection and the ids that were REPLACED rather than
+// added, because "I inserted a thousand documents" and "I inserted
+// nine hundred and replaced a hundred" are different facts about a
+// corpus and an ingestion pipeline that could not tell them apart has
+// no way to notice a duplicate-id bug.
+//
+// ```novo
+// use vsdoc
+//
+// fn add_all(c: VsCollection, ds: [VsDoc]) -> Bool
+//     match vsdoc.upsert_many(c, ds, "text-embedding-3-small")
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn upsert_many(c: VsCollection, ds: [VsDoc], model: Str) -> Result<VsUpsertOutcome, VsFault> []
+    todo("vectorstore-nv.vsdoc.upsert_many")
+
+// A collection and what an upsert did to it.
+pub struct VsUpsertOutcome
+    collection: VsCollection
+    added: Int
+    replaced: [Str]
+
+// Remove one document.
+//
+// A MARK, not a removal: hnsw-nv deletes by marking, as hnswlib does,
+// so the slot and the vector stay until `compact`.  `doc_count` does
+// not count it and `search` does not return it, but the file on disk
+// still holds it — which is worth knowing before a caller deletes
+// personal data.
+//
+// ```novo
+// use vsdoc
+//
+// fn rm(c: VsCollection, id: Str) -> Bool
+//     match vsdoc.delete(c, id)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn delete(c: VsCollection, id: Str) -> Result<VsCollection, VsFault> []
+    todo("vectorstore-nv.vsdoc.delete")
+
+// Rebuild the collection with the marked documents actually gone.
+//
+// The one call that reclaims the space, and the one a caller deleting
+// on somebody's behalf has to make.  It rebuilds the index, so it
+// takes the uniforms hnsw-nv's inserts need — one per live document —
+// and is therefore reproducible.
+//
+// ```novo
+// use vsdoc
+//
+// fn shrink(c: VsCollection, us: [Float]) -> Bool
+//     match vsdoc.compact(c, us)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn compact(c: VsCollection, us: [Float]) -> Result<VsCollection, VsFault> []
+    todo("vectorstore-nv.vsdoc.compact")
+
+// One document by id.
+//
+// ```novo
+// use vsdoc
+//
+// fn one(c: VsCollection, id: Str) -> Bool
+//     match vsdoc.get(c, id)
+//         Some(_) => true
+//         None    => false
+// ```
+pub fn get(c: VsCollection, id: Str) -> ?VsDoc []
+    todo("vectorstore-nv.vsdoc.get")
+
+// Many documents by id, in the order asked for, skipping the ones that
+// are not there.
+//
+// The shape a search's answer needs: `VsHit` carries an id, and
+// hydrating a result page is one call rather than a loop of `get`.
+//
+// ```novo
+// use vsdoc
+//
+// fn some(c: VsCollection, ids: [Str]) -> Int
+//     list.len(vsdoc.get_many(c, ids))
+// ```
+pub fn get_many(c: VsCollection, ids: [Str]) -> [VsDoc] []
+    todo("vectorstore-nv.vsdoc.get_many")
+
+// How many live documents the collection holds.
+//
+// ```novo
+// use vsdoc
+//
+// fn n(c: VsCollection) -> Int
+//     vsdoc.doc_count(c)
+// ```
+pub fn doc_count(c: VsCollection) -> Int []
+    todo("vectorstore-nv.vsdoc.doc_count")
+
+// How many marked-deleted documents still occupy space.
+//
+// Published because it is the number that decides whether to
+// `compact`, and because a store that hid it is a store whose file
+// grows for reasons its owner cannot see.
+//
+// ```novo
+// use vsdoc
+//
+// fn dead(c: VsCollection) -> Int
+//     vsdoc.deleted_count(c)
+// ```
+pub fn deleted_count(c: VsCollection) -> Int []
+    todo("vectorstore-nv.vsdoc.deleted_count")
+
+// Every live document's id, in insertion order.
+//
+// ```novo
+// use vsdoc
+//
+// fn ids(c: VsCollection) -> Int
+//     list.len(vsdoc.ids(c))
+// ```
+pub fn ids(c: VsCollection) -> [Str] []
+    todo("vectorstore-nv.vsdoc.ids")
+
+// Whether a vector may be inserted into this collection.
+//
+// The three checks `upsert` makes, as one question, for a caller
+// validating a batch before it commits to any of it.
+//
+// ```novo
+// use vsdoc
+//
+// fn ok(c: VsCollection, v: [Float], model: Str) -> Bool
+//     match vsdoc.check_vector(c, v, model)
+//         Ok(_)  => true
+//         Err(_) => false
+// ```
+pub fn check_vector(c: VsCollection, v: [Float], model: Str) -> Result<Int, VsFault> []
+    todo("vectorstore-nv.vsdoc.check_vector")
