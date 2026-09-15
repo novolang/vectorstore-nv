@@ -1,6 +1,6 @@
 [package]
 name        = "vectorstore-nv"
-version     = "0.0.1"
+version     = "0.0.2"
 description = "A document store with vectors: documents with text, metadata and an embedding, a typed metadata predicate language, k-nearest search through hnsw-nv with the filter strategy as a named decision rather than a hidden one, BM25 over unicode-nv's tokens, hybrid retrieval merged by reciprocal rank fusion, a file on disk, and the qdrant and chroma HTTP dialects behind the same trait.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 

@@ -1,301 +1,360 @@
 # vectorstore-nv
 
-**Status: NOT IMPLEMENTED — interface only.**
+A vector store keeps documents beside the vectors that stand for them, so
+a program can ask for the documents nearest a query. This package is one in
+novo-lang: documents with text and metadata, a typed metadata filter,
+k-nearest search over
+[hnsw-nv](https://novo-lang.org/packages/hnsw-nv), keyword search by
+[BM25](https://en.wikipedia.org/wiki/Okapi_BM25), the two combined by
+reciprocal rank fusion, a file on disk, and the
+[qdrant](https://qdrant.tech/documentation/) and
+[chroma](https://docs.trychroma.com/) HTTP APIs behind the same trait. It
+is built on hnsw-nv,
+[embeddings-nv](https://novo-lang.org/packages/embeddings-nv) and
+[unicode-nv](https://novo-lang.org/packages/unicode-nv).
 
-Every public function below is published with its signature and its
-effect row, and every body is `todo()`.  Installing this package works;
-calling it panics with `not implemented`.
+**Status: NOT IMPLEMENTED — interface only.** Every function is declared
+with its full signature, but every body is a `todo()` that panics when
+called. The package is published so its design can be reviewed and
+depended on before it is implemented. Version 0.1.0 will be the first
+working release.
 
-## What this is
+## What it is
 
-A document store with vectors.  Documents with text, metadata and an
-embedding; a typed metadata predicate language; k-nearest search
-through hnsw-nv with the filter strategy as a **named decision rather
-than a hidden one**; BM25 over unicode-nv's tokens; hybrid retrieval
-merged by reciprocal rank fusion; a file on disk; and the qdrant and
-chroma HTTP dialects behind the same trait.
+A **document** is an identifier, some text, some metadata as a JSON value,
+and a **vector**: a list of numbers a model produced from the text. A
+**collection** is a set of documents, the index over their vectors, and the
+configuration both were built under.
 
-It embeds nothing.  A vector is a `[Float]` the caller supplies —
-llm-client-nv, ollama-nv or an in-process model produces it — because
-a store that embedded would have taken `[net]` on every insert and
-picked the caller's model for them.
+Searching by vector is **approximate**. hnsw-nv walks a graph from an entry
+point toward the query, so it finds the nearest documents almost always
+rather than always. **Recall** is the fraction of the true nearest it
+found.
 
-## Adding it, and checking it
+A **filter** is a condition on a document's metadata, such as
+`year > 2020`. A filter and an approximate index do not combine the way
+they appear to, and there are three honest ways to apply one.
 
-```bash
-novo pkg add vectorstore-nv    # into your novo.toml
-novo pkg build                 # type- and effect-check the package
-novo test --isolate tests/vssearch_tests.nv
+| Plan | What it does | What it costs |
+| --- | --- | --- |
+| `VsPostFilter` | search for k, then drop what does not match | answers fewer than k without saying so; there may be a thousand matching documents and this found three |
+| `VsPreFilter` | evaluate the filter over the corpus, then compare the survivors exactly | always right; linear in the number of survivors |
+| `VsFilteredTraversal` | walk the graph, skipping rejected nodes | fast; a selective filter can cut the matching documents off from the entry point, and the search answers nothing at all |
+
+**BM25** is a keyword score: how well a document matches a query's words,
+given how rare each word is in the corpus and how long the document is. It
+never looks at meaning, which is why it finds an error code or a function
+name that a vector search puts next to its neighbours.
+
+A **hybrid** search runs both and merges them. **Reciprocal rank fusion**
+merges by position rather than by score: a document's fused score is the
+sum of `1 / (k + rank)` over the lists that found it.
+
+Every comparison this package answers is a **similarity**, where higher is
+closer.
+
+| Quantity | Value |
+| --- | --- |
+| BM25 term-frequency saturation, `k1` | 1.2 |
+| BM25 length normalisation, `b` | 0.75 |
+| BM25+ lower bound, `delta` | 0.0 |
+| Reciprocal rank fusion constant, `k` | 60 |
+| File magic | `NVVS` |
+| File format version | 1 |
+
+Six of the nine modules declare no effects. `vsfile`'s file half is `[fs]`,
+`vshttp`'s client half is `[net]`, and the store calls in `vsstore` cost
+whatever the store they are handed costs. Every codec is published beside
+its effectful call, so a caller that keeps collections in a database column
+or drives its own HTTP client spends neither.
+
+This package embeds nothing. A vector is a list of floats the caller
+supplies.
+
+## Install
+
+```
+novo pkg add vectorstore-nv
 ```
 
-`novo test` is red today and that is the point of the release: every
-assertion fails with `not implemented: vectorstore-nv.<module>.<fn>`.
-They turn green one at a time as bodies land.
-
-## The one example that will work
+## Example
 
 ```novo
 use vsdoc
 use vsfilter
 use vssearch
 use vsstore
+use hnswparam
+use std.list
 
-// Retrieve, and know whether the answer is the whole truth.
+// Find the ten nearest documents published after 2020. No effect row:
+// the in-memory store performs nothing. The same code over a file
+// costs `[fs]` and over a server `[net]`.
 fn recent(s: VsMemory, query: [Float]) -> Result<VsDocResults, VsFault>
+    // Filter first, then compare exactly against what survives. That
+    // plan is always right, and it is linear in the survivors.
     let q = vssearch.with_plan(
                 vssearch.with_filter(vssearch.query(query, 10),
                                      vsfilter.is_clause(VsGt("year", VsInt(2020)))),
                 VsPreFilter)
-
     let r = vsstore.retrieve(s, q)!
-
-    // READ THIS.  A post-filtered search answers fewer than k without
-    // saying so, and the result looks exactly like a correct one.
-    if r.outcome.exhaustive == false
-        println(vssearch.explain(r.outcome))
     Ok(r)
+
+fn main() [io]
+    match hnswparam.default_params(2, HnswCosine)
+        Err(f) => println(f.message())
+        Ok(p)  =>
+            let c = vsdoc.collection("notes", vsdoc.config(2, HnswCosine, "demo-model", p))
+            match recent(vsstore.memory(c), [1.0, 0.0])
+                Err(f) => println(f.message())
+                Ok(r)  =>
+                    // A search that was not exhaustive may have missed
+                    // matches, and its result looks like a complete one.
+                    if r.outcome.exhaustive == false
+                        println(vssearch.explain(r.outcome))
+                    println("${list.len(r.docs)} document(s)")
 ```
 
-No effect row on that function, and that is the trait working: the
-in-memory store performs nothing.  The same code against a file is
-`[fs]` and against a server is `[net]`.
+Build and test with `novo pkg build` and `novo test`. Today `novo test`
+fails on purpose: every test reaches a
+`not implemented: vectorstore-nv.<module>.<fn>` panic. The tests are the
+specification the implementation will have to satisfy.
 
-## The layer, and why
+## What the package contains
 
-`host`, and six of the nine modules declare nothing.
+| Module | Contents |
+| --- | --- |
+| `vsdoc` | A document, a collection's configuration, the collection itself, and the calls that add, remove and read documents. |
+| `vsfilter` | The metadata predicate language: values, clauses, the combinators, and what a filter means over one document. |
+| `vsbm25` | The keyword index: the tokenizer, the parameters, building and scoring, and the per-term numbers behind a score. |
+| `vsrank` | Reciprocal rank fusion: the constant, the weights, the ranked lists, and the overlap between two of them. |
+| `vssearch` | A query, the four filter plans, the result and what it says about itself, exact search, and the recall measurement. |
+| `vsstore` | The store trait, the in-memory store, and the three calls that work over any store. |
+| `vsfile` | The serialised collection, its header, and the four file operations. |
+| `vshttp` | The two server dialects: their requests, their replies, their errors, and the client behind the same trait. |
+| `vsfault` | The thirteen ways a store call fails, and whether each is worth retrying. |
 
-| module | row | why |
-| --- | --- | --- |
-| `vsfault` | `[]` throughout | a fault is a value |
-| `vsdoc` | `[]` throughout | a collection is a value; every call takes one and returns one |
-| `vsfilter` | `[]` throughout | a filter is a value and evaluating one is arithmetic |
-| `vsbm25` | `[]` throughout | an index is a value and scoring is arithmetic |
-| `vsrank` | `[]` throughout | fusing two rankings is arithmetic |
-| `vssearch` | `[]` throughout | a search over a collection value |
-| `vsfile`'s format half | `[]` | `to_bytes` / `from_bytes` / `peek_header` |
-| `vsfile`'s file half | `[fs]` | `save`, `load`, `open`, `flush` |
-| `vshttp`'s codec half | `[]` | `encode_search`, `decode_search`, `encode_filter` |
-| `vshttp`'s client half | `[net]` | `std.tls`'s own row |
-| `vsstore.retrieve` and friends | `[e]` | effect-POLYMORPHIC: whatever the store costs |
+## How to choose an entry point
 
-Every codec is published beside its effectful call, so a caller that
-keeps collections in a database column, or drives its own HTTP client,
-uses this package without either effect row.
+**`vsstore.retrieve` works over any store.** It takes the trait, so the
+same code runs against memory, a file and a server, and its effects are
+that store's. `ingest` is the batched insert and `check_query` is the
+check on its own.
 
-## The load-bearing interface
+**`vssearch.search` takes a collection value directly.** Use it when the
+collection is in the program's own state and no store wrapper is wanted. It
+declares no effects.
 
-**`VsFilterPlan`, and `VsSearchOutcome.exhaustive` beside it.**
+**One query type covers all three searches.** `vssearch.query` is a vector
+search, `text_query` is keyword only, and `hybrid_query` is both. A caller
+switching between them changes a value rather than a call.
 
-A filter and an approximate index do not compose the way everybody
-assumes.  HNSW is a graph whose search walks from an entry point toward
-the query, and its guarantee is about a walk over *all* the nodes.  A
-metadata filter changes which nodes count, and there are only three
-honest ways to apply it:
+**`vssearch.exact_search` compares against every document.** It is the
+answer `recall` measures an approximate search against, and the right
+choice for a collection of a few thousand documents.
 
-- **Post-filter.**  Search for k, then drop what does not match.
-  **Silently answers fewer than k.**  A caller asking for 10 documents
-  with `year > 2020` gets 3 — not because only 3 match the filter, but
-  because only 3 of the top 10 by vector did.  There may be a thousand
-  matching documents and this found three.  Every naive implementation
-  does this, and the result is a value that looks exactly like a
-  correct one.
-- **Pre-filter.**  Evaluate the filter over the corpus, then compare
-  the query against the survivors exactly.  Always right, and linear in
-  the number of survivors — cheap for a narrow filter, a full scan for
-  a broad one.
-- **Filtered traversal.**  Walk the graph, skipping rejected nodes.
-  hnsw-nv's `search_filtered` is this.  Fast, and its failure is the
-  interesting one: the graph is connected *through* the nodes that were
-  skipped, so a selective filter can disconnect the matching documents
-  from the entry point and the search answers **nothing at all**,
-  though thousands match.
+**`vsfile.to_bytes` and `from_bytes` have no effects**, and `save` and
+`load` are the same thing against a path. Take the first pair for a
+collection kept in a database column, an object store or a test.
 
-So the plan is a value the caller passes; `VsAuto` chooses by estimated
-selectivity with the rule written down (`vssearch.plan_for`, threshold
-published as `pre_filter_max`) rather than tuned; **a post-filter is
-never chosen automatically**, because it is the plan whose failure is
-silent; and **every result says which plan ran and whether it was
-exhaustive**.
+**`vshttp.encode_search` and `decode_search` have no effects**, and the
+trait implementation on `VsHttp` is the same exchange over a socket.
 
-That last field is the one no other vector store answers.  A result of
-three documents is either "three documents match" or "three of the ten
-I looked at match, and I do not know how many others do".  A caller
-that cannot tell those apart cannot tell a working retrieval pipeline
-from a broken one.
+## The rules a user needs
 
-## The score direction, which is the other silent one
+1. **Read `VsSearchOutcome.exhaustive` before acting on a result.** A
+   result of three documents is either "three documents match" or "three of
+   the ten I looked at match, and I do not know how many others do". It is
+   true for a pre-filter and for an unfiltered search over a small
+   collection, and false for a post-filter that hit its over-fetch limit
+   and for a filtered traversal.
+2. **A post-filter is never chosen automatically.** Its failure is the
+   silent one: a caller asking for ten documents with `year > 2020` gets
+   three, because only three of the top ten by vector matched, not because
+   only three documents match. `VsAuto` chooses between a pre-filter and a
+   filtered traversal, and a caller that wants a post-filter names it.
+3. **`VsAuto`'s rule is published, not tuned.** When the filter's estimated
+   selectivity puts the survivors below `vssearch.pre_filter_max`, it
+   pre-filters, because an exact scan over a small set wins outright. Above
+   that it traverses, because a linear scan over most of a corpus is what
+   an index exists to avoid. `vssearch.plan_for` answers what it would
+   choose and `estimate_matches` is the estimate.
+4. **`VsSearchOutcome.plan` is the plan that ran, and `VsAuto` never
+   appears in it.** `VsAuto` is a request and this is the answer.
+5. **A score in this package is a similarity and higher is closer.**
+   hnsw-nv answers distances and compares by minimum; `embsim.as_distance`
+   is the line between the two conventions. Getting it backwards produces a
+   store that returns the furthest documents and looks like it works.
+   `VsHit.distance` is the index's own number, for measuring recall.
+6. **The collection records the model its vectors came from.** Two models
+   of the same dimension are two different spaces, and querying one with a
+   vector from the other gives distances that are arithmetic, plausible and
+   meaningless. `VsConfig.model` is free text compared for equality, and
+   `VsModelMismatch` is refused at upsert, at search and at load. The file
+   header carries it, so a collection loaded into the wrong program is
+   refused before a vector is read.
+7. **A coordinate that is not a finite number is refused on the way in.**
+   Downstream it is silent: one such coordinate makes every distance
+   involving that document not a number, and the document is simply never
+   the nearest.
+8. **Reciprocal rank fusion merges ranks, and that is deliberate.** A BM25
+   score is an unbounded sum over a particular corpus, and adding a
+   document changes every score in it. A cosine similarity is between −1
+   and 1 and means the same thing everywhere. There is no exchange rate
+   between the two, so `alpha * vector + (1 - alpha) * keyword` is
+   arithmetic on incomparable units. `VsRanking` therefore carries ids and
+   no scores.
+9. **Fusing by rank throws away the margin.** A vector search whose top hit
+   is far ahead of its second and one whose top ten are indistinguishable
+   produce the same ranks. `VsFusion.weights` is the escape for a caller
+   who has measured their own corpus, and `VsSource.VsFromBoth` is what an
+   explanation shows instead.
+10. **A filter is a value, not a JSON document.** Everything in the
+    language translates to both server dialects, so a filter the compiler
+    accepted cannot be refused at run time by one of them. A substring
+    match and a regular expression are absent for that reason.
+11. **Negation applies to one clause, not to a subtree.** `not (year >
+    2020)` is true for a document with no `year` at all, which is almost
+    never what was meant. `VsMissing` is the explicit way to ask for an
+    absent field, and it is separate from a negated `VsExists` because
+    absent and JSON null are two states.
+12. **There is no implicit coercion in a filter.** Comparing the string
+    `"2021"` with the number 2020 is `VsBadFilter`. Both server dialects
+    silently answer false, which is indistinguishable from no document
+    matching.
+13. **`VsAll` and `VsNone` are different.** "The user selected no facets"
+    and "the user selected an impossible combination" are different
+    questions, and a store that answered `VsAll` for the second returns the
+    whole corpus.
+14. **`vsfilter.matches` is what a filter means.** Each server translation
+    is tested against it, with the same filter and the same document
+    through all three.
+15. **A hybrid search on a collection with no keyword index is refused.**
+    `VsUnsupportedQuery` names what was missing, which is better than a
+    hybrid search that quietly becomes a vector search.
+    `vsdoc.with_keyword_index` turns one on.
+16. **The file is not a database.** `save` writes the whole collection and
+    `load` reads it: no concurrent writer, no partial update, no
+    transaction. `save` writes to a temporary name in the same directory
+    and renames over the target, so a process that died halfway leaves the
+    previous collection intact. A corpus that changes faster than it can be
+    rewritten wants a server.
+17. **The file carries the index rather than rebuilding it.** A hundred
+    thousand vectors take minutes to index and milliseconds to read. That
+    is safe because hnsw-nv's serialised form has a magic, a version and
+    stated field widths.
+18. **A document id is not the same thing in both servers.** qdrant's point
+    id is an unsigned integer or a UUID and chroma's is any string.
+    `vshttp.point_id` hashes a non-UUID id into a stable UUID and keeps the
+    original in the payload, so a qdrant collection written by this package
+    has an `id` payload field another client has to read.
+19. **Neither server reports whether a filtered search was exhaustive**, so
+    `exhaustive` is false for every filtered remote query. A caller that
+    needs the guarantee runs the query locally.
+20. **chroma has no sparse vectors.** A hybrid query against it is
+    `VsUnsupportedQuery` naming the server.
+21. **A remote store is not a value.** `vsstore.snapshot` is on the local
+    store only. `vshttp.scroll` is the remote equivalent, and it is named
+    differently because downloading a corpus a page at a time is a
+    different thing.
+22. **A delete marks rather than removes.** `vsdoc.deleted_count` is how
+    many are marked and `vsdoc.compact` rebuilds without them, taking the
+    uniforms hnsw-nv's insertion needs.
 
-hnsw-nv answers **distances** and compares by minimum; a ranking sorts
-by **maximum similarity**.  `embsim.as_distance` is the one line
-between the two conventions, and getting it backwards produces a store
-that returns the *furthest* documents and looks like it works — the
-answers are documents, they are ordered, and they are wrong.
+## What is not included
 
-So `VsHit.score` is a similarity in every path through this package,
-higher being closer, with `distance` beside it for a caller measuring
-recall against the index's own numbers.  `vshttp` normalises the same
-way: qdrant answers a similarity for cosine and a distance for
-euclidean, chroma answers a distance always, and both come out here as
-similarities.
+- **Embedding.** A vector is a list of floats the caller supplies. A store
+  that embedded would take `[net]` on every insert and choose the caller's
+  model for them.
+- **Concurrency.** A collection is a value. Two writers are two values.
+- **A transaction log.** See rule 16.
+- **A substring match or a regular expression in a filter.** Neither
+  translates to both server dialects.
+- **Arbitrary filter expressions.** See rule 10.
+- **A microcontroller build.** The package is `host`: it has a file and a
+  socket in it.
 
-## Reciprocal rank fusion merges ranks, not scores
+## Related packages
 
-A BM25 score is an unbounded sum of per-term weights over a particular
-corpus — 14.2 is a big number for one index and a small one for
-another, and adding a document changes every score in it.  A cosine
-similarity is in [-1, 1] and means the same thing everywhere.  **The
-two numbers are not on a scale; there is no exchange rate between
-them.**
+- [hnsw-nv](https://novo-lang.org/packages/hnsw-nv) is the approximate
+  index and its serialised form. Its `search_filtered` is what
+  `VsFilteredTraversal` calls, and its distances are what `VsHit.distance`
+  carries.
+- [embeddings-nv](https://novo-lang.org/packages/embeddings-nv) is the
+  arithmetic that produces a vector from a model's output: pooling,
+  normalisation, truncation and quantisation. `embsim.as_distance` is the
+  one line between its convention and the index's.
+- [unicode-nv](https://novo-lang.org/packages/unicode-nv) gives BM25 its
+  word boundaries and case folding. A keyword index that split on ASCII
+  spaces would index a Japanese document as one term.
+- [llm-client-nv](https://novo-lang.org/packages/llm-client-nv) and
+  [ollama-nv](https://novo-lang.org/packages/ollama-nv) are two ways to
+  obtain the vectors this store keeps.
+- `std.store` in the standard library is an in-memory vector store for
+  retrieval-augmented generation. It compares every vector, has no
+  metadata filter, no keyword index and no file, and it is the right thing
+  for a few thousand documents in one process.
+- `std.llm` in the standard library computes embeddings as well as running
+  inference.
+- `std.json` is the metadata type a document carries and a filter reads.
 
-So every `alpha * vector_score + (1 - alpha) * keyword_score` a
-retrieval pipeline contains is arithmetic on incomparable units, and it
-works exactly as well as the normalisation somebody guessed at — which
-is why tuning `alpha` never feels like it converges.  Min-max
-normalising each result set is worse in a specific way: it makes the
-top score 1 in *every* result set, so a query where the keyword half
-found nothing relevant still contributes a full-strength 1.0 at the
-top.
+## Tests
 
-Ranks are comparable.  First is first in both lists.  RRF scores a
-document as the sum of `1 / (k + rank)` across the lists that found it
-— no normalisation, no weights to tune, no corpus dependence — and a
-document found second and third beats one found first and nowhere.
-Cormack, Clarke and Buettcher's `k` of 60 is the default and is named
-as theirs.  `VsRanking` carries **ids and no scores**, so a caller
-cannot hand the fuser a score it wanted fused.
+```bash
+novo test tests/vsvalue_tests.nv     # 31 tests: documents, filters, fusion, faults
+novo test tests/vssearch_tests.nv    # 14 tests: the four plans and what a result says
+novo test tests/vsstore_tests.nv     #  8 tests: the trait and the in-memory store
+novo test tests/vsio_tests.nv        #  7 tests: the file format and the two dialects
+```
 
-The cost is stated too: fusing by rank throws away the **margin**.  A
-vector search whose top hit is far ahead of its second and one whose
-top ten are indistinguishable produce the same ranks.  `weights` is the
-escape for a caller who has measured their own corpus, and
-`VsSource.VsFromBoth` is what an explanation shows instead.
+The BM25 numbers are Robertson and Walker's `k1` of 1.2 and `b` of 0.75,
+and the BM25+ lower bound is Lv and Zhai's. The fusion constant of 60 is
+Cormack, Clarke and Buettcher's. The filter semantics are
+`vsfilter.matches`, and the two server translations are asserted against it
+rather than against a transcript.
 
-## The collection records the model it was built with
+The suite asserts what each plan does to `exhaustive`, that a post-filter
+is never chosen automatically, and that a score coming out of either server
+is a similarity.
 
-Two embedding models of the same dimension are two different spaces.
-Querying a collection built with one using a vector from the other
-produces distances that are arithmetic, plausible and meaningless, and
-every document comes back in an order that has nothing to do with the
-query.  **Nothing else in a retrieval pipeline catches it** — the
-results look like results.
+The tests compile today and fail at run, each on the
+`not implemented: vectorstore-nv.<module>.<fn>` panic that is its body.
+That is the expected state of an interface release. They turn green one at
+a time as bodies land.
 
-So `VsConfig.model` is a string the caller chooses, compared for
-equality and nothing more, and `VsModelMismatch` is refused at
-`upsert`, at `search`, and at `load` — the file header carries it, so a
-collection loaded into the wrong program is refused before a vector is
-read.
+## Implementation status
 
-## The filter is a small typed language
-
-Every remote store in this space takes a filter as a nested JSON
-object, and the temptation is to let the caller write one — which makes
-every filter a run-time parse, a typo a 400 from a server, and the two
-dialects' incompatible spellings the caller's problem.
-
-A value instead.  What is deliberately *not* in it:
-
-- **No arbitrary expressions.**  Everything here translates to *both*
-  dialects; a construct only one supports would make `vshttp` refuse at
-  run time for a filter the compiler accepted.
-- **No `not` over a subtree**, only over one clause.  `not (year >
-  2020)` is true for a document with no `year` at all, which is almost
-  never what the person meant; the one-clause form keeps that visible
-  and `VsMissing` is the explicit way to ask.
-- **No implicit coercion.**  `"2021" > 2020` is `VsBadFilter`.  Both
-  remote dialects silently answer false, which is indistinguishable
-  from "no documents matched".
-
-`vsfilter.matches` is this package's definition of what a filter means,
-and each remote translation is tested against it — the same filter and
-the same document through all three.
-
-## What novoagent's retrieval would take
-
-orbit/novoagent has no retrieval today.  Its context manager is an
-eviction policy over a monotonically growing transcript: the system
-prompt and the task are pinned, the last K turns are kept verbatim,
-older tool observations collapse to a one-line receipt, and the run
-ends as `budget_exhausted` when the ceiling is crossed.  The
-observations it collapses are mostly documentation pages — learning the
-language *is* the task there — and the collapse is lossy on purpose:
-the fact of the call survives and the payload does not.
-
-What this package changes is where the payload goes. A collapsed
-observation's text becomes a document; the receipt stays in the
-transcript as it does now; and the agent gets a retrieval tool that
-searches what it has already read. Four things it would take:
-
-- **`VsDoc.metadata` as the receipt**: the tool name, the arguments
-  and the turn number, so `VsFilter` can scope a search to this run, to
-  documentation only, or to observations since the last compiler error.
-- **`exhaustive`.**  An agent that retrieved three fragments and
-  concluded the answer is not in its memory has made a decision on
-  incomplete information without knowing it.  The one field that makes
-  "I found three" and "I found three of the ten I looked at" different
-  is the one an agent loop most needs.
-- **Hybrid search, not vector search.**  The agent's queries are half
-  natural language and half identifiers — a function name, an error
-  code, a module. `ORA-01555` and `E2004` embed to nearly the same
-  place as their neighbours and mean something specific; BM25 tells
-  them apart because it never looked at meaning.
-- **The in-memory store.**  An agent run is minutes long and its corpus
-  is what it has read, so the collection is a value in the loop's own
-  state, `[]` throughout — no file, no server, and testable without
-  either.
-
-What it does **not** take is the eviction policy: which turns are
-pinned and what collapses is the agent's decision about its own
-attention, and a retrieval index is a place to put what was collapsed
-rather than a reason to collapse less.
-
-## The file is not a database
-
-`save` writes the whole collection and `load` reads it.  No concurrent
-writer, no partial update, no transaction.  `save` writes to a
-temporary name in the same directory and renames over the target, so a
-process that died halfway leaves the previous collection intact rather
-than a truncated file — a rename within a directory is the only atomic
-operation a filesystem offers, and a store whose whole state is one
-file should use it.
-
-A corpus that changes faster than it can be rewritten wants a server,
-which is `vshttp`.  That line is stated here rather than discovered at
-the size where it starts mattering.
-
-The file carries hnsw-nv's serialised index rather than rebuilding it:
-a hundred thousand vectors take minutes to index and milliseconds to
-read.  `hnswio` has a magic, a version and stated widths, which is what
-makes that safe — hnswlib's own raw memory dump has none of the three.
-
-## Two servers, one trait, and what is not hidden
-
-- **A document id is not the same thing.**  qdrant's point id is an
-  unsigned integer or a UUID; chroma's is any string.  `vshttp.point_id`
-  hashes a non-UUID id into a stable UUID and keeps the original in the
-  payload — so a qdrant collection written by this package has an `id`
-  payload field another client has to read, and that is said here
-  rather than discovered.
-- **Neither server reports whether a filtered search was exhaustive**,
-  so `exhaustive` is false for every filtered remote query.  A loss of
-  information rather than a defect, and a caller that needs the
-  guarantee runs the query locally.
-- **chroma has no sparse vectors.**  A hybrid query against it is
-  `VsUnsupportedQuery` naming the server, not a vector search that
-  quietly dropped its keyword half.
-- **A remote store is not a value.**  `snapshot` is on the local store
-  only; the remote equivalent is `vshttp.scroll`, and it is named
-  differently because downloading a corpus one page at a time is a
-  different thing.
-
-## Dependencies
-
-Three, all `core`:
-
-- **hnsw-nv** — the index, and `hnswio`'s serialised form.
-- **embeddings-nv** — `embsim.as_distance`, the one line between the
-  index's minimum-distance rule and a ranking's maximum-similarity one.
-- **unicode-nv** — word boundaries and case folding for BM25's tokens.
+| Item | Implemented |
+| --- | --- |
+| `vsdoc.doc`, `.with_metadata`, `.with_vector`, `.config`, `.with_keyword_index`, `.collection` | no |
+| `vsdoc.upsert`, `.upsert_many`, `.delete`, `.compact` | no |
+| `vsdoc.get`, `.get_many`, `.doc_count`, `.deleted_count`, `.ids`, `.check_vector` | no |
+| `vsfilter.is_clause`, `.all_of`, `.any_of`, `.check`, `.matches` | no |
+| `vsfilter.clause_count`, `.fields_of`, `.simplify`, `.is_satisfiable` | no |
+| `vsfilter.value_of`, `.value_json` | no |
+| `vsbm25.default_params`, `.params`, `.tokenizer`, `.with_stop_words`, `.tokenize` | no |
+| `vsbm25.build`, `.empty_index`, `.add`, `.score_all`, `.top_k` | no |
+| `vsbm25.idf`, `.doc_frequency`, `.average_length`, `.unknown_terms`, `.term_count` | no |
+| `vsrank.default_fusion`, `.fusion`, `.ranking`, `.of_hits`, `.check` | no |
+| `vsrank.fuse`, `.contribution`, `.found_in`, `.take_k`, `.overlap` | no |
+| `vssearch.plan_for`, `.pre_filter_max`, `.estimate_matches` | no |
+| `vssearch.query`, `.text_query`, `.hybrid_query`, `.with_filter`, `.with_plan`, `.with_ef`, `.with_model` | no |
+| `vssearch.search`, `.search_docs`, `.exact_search`, `.recall`, `.check`, `.explain` | no |
+| `vsstore.memory`, `.with_tokenizer`, `.with_bm25`, `.with_fusion`, `.snapshot` | no |
+| `VsStore` for `VsMemory`, for `VsFileStore` and for `VsHttp`: all five methods | no |
+| `vsstore.retrieve`, `.ingest`, `.check_query` | no |
+| `vsfile.VS_FILE_MAGIC`, `.VS_FILE_VERSION` | yes (they are constants) |
+| `vsfile.supported_versions`, `.to_bytes`, `.from_bytes`, `.peek_header`, `.size_bound`, `.is_collection` | no |
+| `vsfile.save`, `.load`, `.read_header`, `.is_collection_file`, `.open`, `.flush` | no |
+| `vshttp.dialect_name`, `.dialect_of_name`, `.qdrant`, `.chroma`, `.with_header`, `.with_model` | no |
+| `vshttp.encode_filter`, `.encode_search`, `.encode_upsert` | no |
+| `vshttp.decode_search`, `.decode_get`, `.decode_error` | no |
+| `vshttp.search_path`, `.upsert_path`, `.point_id`, `.check_query` | no |
+| `vshttp.scroll`, `.health`, `.ensure_collection` | no |
+| `vsfault.is_retryable`, `.is_caller_error`, `VsFault.message` | no |
 
 ## Licence
 
-Apache-2.0.
+Apache-2.0. See `LICENSE`.
+
+<!-- docs/writing-a-readme.md is the style guide for this page. -->
