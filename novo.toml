@@ -1,6 +1,6 @@
 [package]
 name        = "vectorstore-nv"
-version     = "0.0.2"
+version     = "0.0.3"
 description = "A document store with vectors: documents with text, metadata and an embedding, a typed metadata predicate language, k-nearest search through hnsw-nv with the filter strategy as a named decision rather than a hidden one, BM25 over unicode-nv's tokens, hybrid retrieval merged by reciprocal rank fusion, a file on disk, and the qdrant and chroma HTTP dialects behind the same trait.  Interface only — every body is a todo()."
 license     = "Apache-2.0"
 
@@ -37,15 +37,15 @@ novo        = ">= 0.8.9"
 # The index.  `HnswIndex` is a value, every call takes one and returns
 # one, and `hnswio` is the serialised form `vsfile` writes.  `core`, so
 # `dep-layer` holds.
-hnsw-nv = "^0.0.1"
+hnsw-nv = "^0.1.0"
 
 # The similarity half.  `embsim.as_distance` is the one line between
 # hnsw-nv's rule — an index compares by MINIMUM — and a ranking's,
 # which sorts by maximum; getting that backwards is a store that
 # returns the furthest documents and looks like it works.  `core`.
-embeddings-nv = "^0.0.1"
+embeddings-nv = "^0.1.0"
 
 # Tokens for BM25.  Word boundaries and case folding are Unicode
 # questions, and a keyword index that split on ASCII spaces indexes a
 # Japanese document as one term.  `core`.
-unicode-nv = "^0.0.1"
+unicode-nv = "^0.1.3"
