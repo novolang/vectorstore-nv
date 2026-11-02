@@ -11,6 +11,10 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
 - File handles are bound with `let Some(fd) = ... else`, the keyword-index rebuild propagates with `!`, and the fused-hit source is chosen by a `match` over which halves ranked it; no public signature or result changes.
 
+### Known follow-ups
+
+- The `VsStore` mutators (`vs_upsert`, `vs_delete`) take `self` by value and write through a `var shared = self` alias in `VsMemory` and `VsFileStore`.  Declaring them `var self` would remove the aliases, but it is a breaking change: a caller holding a `let`-bound store could no longer call them (E2036), so it waits for the next breaking release and is not made in a patch.
+
 ## 0.1.0 — 2026-10-11
 
 The first implementation of the interface published as 0.0.1: every
