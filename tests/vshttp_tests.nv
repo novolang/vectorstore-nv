@@ -1,0 +1,1477 @@
+// vshttp_tests.nv — the two dialects' spellings, and the frames on the
+// wire.
+//
+// A REMOTE STORE'S MISTAKES ARE INVISIBLE.  A filter translated into
+// the wrong shape still compiles, still sends and still answers
+// documents — just not the ones the caller asked for.  So every
+// translation here is pinned to the spelling its server documents, and
+// every refusal the module promises is pinned by name.
+//
+// The framing is pinned by feeding the parser canned bytes, the
+// refusals by asking for a port nothing listens on, and the rest by
+// BEING the server: the loopback test at the end of this file opens a
+// listener on a port the kernel picks, drives every method of the
+// remote store from a worker cell, and serves each request itself — so
+// the bytes a real client writes and the decoding of a real socket's
+// answer are pinned over a socket and not over a string.  What is left
+// is the TLS half, which needs a certificate this package does not
+// carry, and two readers that cannot fail on the type they were asked
+// about; those lines carry a `cov: skip` marker in `src/vshttp.nv`.
+
+use std.test
+use std.json
+use std.list
+use std.net
+use std.str
+use hnswparam
+use vsdoc
+use vsfault
+use vsfilter
+use vssearch
+use vshttp
+
+// A qdrant client, and a chroma one, at the ports the servers listen
+// on.  Nothing here opens a socket unless the test names `[io, net]`.
+fn a_client() -> VsHttp
+    vshttp.qdrant("http://localhost:6333", "notes")
+
+fn a_chroma_client() -> VsHttp
+    vshttp.chroma("http://localhost:8000", "notes")
+
+fn a_doc(id: Str, text: Str, v: [Float], meta: JsonValueH) -> VsDoc
+    vsdoc.with_metadata(vsdoc.doc(id, text, v), meta)
+
+// Whether a JSON value has this member at all, which is how the
+// `must` / `must_not` pins below are read.
+fn has(v: JsonValueH, k: Str) -> Bool
+    match json.get(v, k)
+        None    => false
+        Some(_) => true
+
+// A body as a JSON value, for tests that need to look inside one.
+fn body_of(text: Str) -> JsonValueH
+    json.parse(text) ?? json.object([])
+
+// A hit no reply can produce, for the `list.get` fallback: an assertion
+// against it fails the test the same way a missing second hit should.
+fn a_sentinel_hit() -> VsHit
+    VsHit { id: "?", score: 0.0 - 1.0, distance: 0.0 - 1.0, source: VsFromVector(0) }
+
+// ── the dialect and its paths ───────────────────────────────────────
+
+@test
+fn test_a_dialect_is_named_and_named_back() [io]
+    match vshttp.dialect_of_name("qdrant")
+        Some(d) =>
+            test.case("the name in a configuration file is the name of the dialect")
+            test.assert(vshttp.dialect_name(d) == "qdrant")
+        None    => test.assert(false)
+
+    match vshttp.dialect_of_name("chroma")
+        Some(d) =>
+            test.case("and the other one")
+            test.assert(vshttp.dialect_name(d) == "chroma")
+        None    => test.assert(false)
+
+    test.case("a name that is neither is not a dialect, and is not guessed at")
+    match vshttp.dialect_of_name("Qdrant")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    match vshttp.dialect_of_name("")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("the port each server listens on when the URL names none")
+    test.assert_eq(vshttp.default_port(VsQdrant), 6333)
+    test.assert_eq(vshttp.default_port(VsChroma), 8000)
+
+@test
+fn test_every_path_a_client_drives_is_the_dialect_s_own() [io]
+    let q = a_client()
+    let c = a_chroma_client()
+
+    test.assert(vshttp.search_path(q) == "/collections/notes/points/search")
+    test.assert(vshttp.upsert_path(q) == "/collections/notes/points/upsert")
+    test.assert(vshttp.delete_path(VsQdrant, "notes") == "/collections/notes/points/delete")
+
+    test.case("chroma mounts everything under /api/v1")
+    test.assert(vshttp.search_path(c) == "/api/v1/collections/notes/query")
+    test.assert(vshttp.upsert_path(c) == "/api/v1/collections/notes/upsert")
+    test.assert(vshttp.delete_path(VsChroma, "notes") == "/api/v1/collections/notes/delete")
+
+@test
+fn test_the_metric_name_is_the_one_this_server_knows_it_by() [io]
+    // Two servers spell the same metric two ways.  A collection created
+    // with the other server's spelling is a collection built with
+    // another metric's semantics, and every distance it answers is
+    // plausible nonsense.
+    test.assert(vshttp.qdrant_distance(HnswCosine) == "Cosine")
+    test.assert(vshttp.qdrant_distance(HnswL2) == "Euclid")
+    test.assert(vshttp.qdrant_distance(HnswInner) == "Dot")
+
+    test.case("and chroma's own three names")
+    test.assert(vshttp.chroma_space(HnswCosine) == "cosine")
+    test.assert(vshttp.chroma_space(HnswL2) == "l2")
+    test.assert(vshttp.chroma_space(HnswInner) == "ip")
+
+    test.case("the two servers agree about no metric's name, so neither list may be reused")
+    test.assert(vshttp.qdrant_distance(HnswCosine) != vshttp.chroma_space(HnswCosine))
+    test.assert(vshttp.qdrant_distance(HnswL2) != vshttp.chroma_space(HnswL2))
+    test.assert(vshttp.qdrant_distance(HnswInner) != vshttp.chroma_space(HnswInner))
+
+// ── qdrant's filter ─────────────────────────────────────────────────
+
+@test
+fn test_a_qdrant_filter_is_the_one_qdrant_documents() [io]
+    match vshttp.encode_filter(VsQdrant, VsAll)
+        Ok(v)  =>
+            test.case("the filter that matches everything is an empty object")
+            test.assert(json.stringify(v) == "{}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsEq("lang", VsStr("da"))))
+        Ok(v)  =>
+            test.case("an equality")
+            test.assert(json.stringify(v) == "{\"key\":\"lang\",\"match\":{\"value\":\"da\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsGt("year", VsInt(2020))))
+        Ok(v)  =>
+            test.case("a range")
+            test.assert(json.stringify(v) == "{\"key\":\"year\",\"range\":{\"gt\":2020}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsIn("lang", [VsStr("da"), VsStr("en")])))
+        Ok(v)  =>
+            test.case("membership is `match.any`")
+            test.assert(json.stringify(v) == "{\"key\":\"lang\",\"match\":{\"any\":[\"da\",\"en\"]}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsContains("tags", VsStr("x"))))
+        Ok(v)  =>
+            test.case("and a contains is the same condition, because qdrant matches arrays")
+            test.assert(json.stringify(v) == "{\"key\":\"tags\",\"match\":{\"value\":\"x\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsPrefix("title", "ab")))
+        Ok(v)  =>
+            test.case("a prefix")
+            test.assert(json.stringify(v) == "{\"key\":\"title\",\"match\":{\"prefix\":\"ab\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsExists("tag")))
+        Ok(v)  =>
+            test.case("existence is the negation of is_empty")
+            test.assert(json.stringify(v) == "{\"must_not\":[{\"is_empty\":{\"key\":\"tag\"}}]}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsMissing("tag")))
+        Ok(v)  =>
+            test.case("and absence is is_empty")
+            test.assert(json.stringify(v) == "{\"is_empty\":{\"key\":\"tag\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, VsNot(VsLt("year", VsInt(2000))))
+        Ok(v)  =>
+            test.case("a negation nests the clause in must_not")
+            test.assert(json.stringify(v) == "{\"must_not\":[{\"key\":\"year\",\"range\":{\"lt\":2000}}]}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant,
+                               VsAnd([vsfilter.is_clause(VsEq("a", VsInt(1))),
+                                      vsfilter.is_clause(VsEq("b", VsInt(2)))]))
+        Ok(v)  =>
+            test.case("a conjunction is must")
+            test.assert(json.stringify(v) == "{\"must\":[{\"key\":\"a\",\"match\":{\"value\":1}},{\"key\":\"b\",\"match\":{\"value\":2}}]}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant,
+                               VsOr([vsfilter.is_clause(VsEq("a", VsInt(1))),
+                                     vsfilter.is_clause(VsEq("b", VsInt(2)))]))
+        Ok(v)  =>
+            test.case("and a disjunction is should")
+            test.assert(json.stringify(v) == "{\"should\":[{\"key\":\"a\",\"match\":{\"value\":1}},{\"key\":\"b\",\"match\":{\"value\":2}}]}")
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_filter_that_matches_nothing_goes_in_must_and_never_in_must_not() [io]
+    // A `must_not` over a condition on a field a point does not have is
+    // SATISFIED by that point: qdrant's `must_not` is `(NOT A)`, and
+    // "no such field" is not A.  Written that way `VsNone` matched
+    // every point qdrant had — which is `VsAll`, the one answer this
+    // arm exists to not give.
+    match vshttp.encode_filter(VsQdrant, VsNone)
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.case("the impossible condition is a must")
+            test.assert(has(v, "must"))
+            test.case("and must_not, which would have selected the whole collection, is absent")
+            test.assert(not has(v, "must_not"))
+
+            test.case("against a field no document is ever written with")
+            test.assert(str.contains(json.stringify(v), "__vectorstore_nv_impossible__"))
+
+    test.case("chroma has one operator shape and cannot make the same mistake")
+    match vshttp.encode_filter(VsChroma, VsNone)
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert(json.stringify(v) == "{\"__vectorstore_nv_impossible__\":{\"\$eq\":true}}")
+
+// ── chroma's filter ─────────────────────────────────────────────────
+
+@test
+fn test_a_chroma_filter_is_the_one_chroma_documents() [io]
+    match vshttp.encode_filter(VsChroma, VsAll)
+        Ok(v)  =>
+            test.case("an empty `where` matches everything, which is chroma's own rule")
+            test.assert(json.stringify(v) == "{}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsEq("lang", VsStr("da"))))
+        Ok(v)  =>
+            test.case("one field, one operator")
+            test.assert(json.stringify(v) == "{\"lang\":{\"\$eq\":\"da\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsIn("lang", [VsStr("da"), VsStr("en")])))
+        Ok(v)  =>
+            test.case("membership is \$in")
+            test.assert(json.stringify(v) == "{\"lang\":{\"\$in\":[\"da\",\"en\"]}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsContains("tags", VsStr("x"))))
+        Ok(v)  =>
+            test.case("array membership is \$contains, NOT an \$in")
+            test.assert(json.stringify(v) == "{\"tags\":{\"\$contains\":\"x\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsAnd([vsfilter.is_clause(VsEq("a", VsInt(1))),
+                                               vsfilter.is_clause(VsEq("b", VsInt(2)))]))
+        Ok(v)  =>
+            test.case("nesting is \$and and \$or")
+            test.assert(json.stringify(v) == "{\"\$and\":[{\"a\":{\"\$eq\":1}},{\"b\":{\"\$eq\":2}}]}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsOr([vsfilter.is_clause(VsEq("a", VsInt(1))),
+                                              vsfilter.is_clause(VsEq("b", VsInt(2)))]))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"\$or\":[{\"a\":{\"\$eq\":1}},{\"b\":{\"\$eq\":2}}]}")
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_negated_clause_becomes_chroma_s_complement_operator() [io]
+    // chroma has no `\$not`, so a negation becomes the operator that is
+    // its complement.  The complement is exact for a field the document
+    // HAS; on a field it does not have the two answers part company,
+    // which is one of the three disagreements the module header names.
+    match vshttp.encode_filter(VsChroma, VsNot(VsEq("lang", VsStr("da"))))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"lang\":{\"\$ne\":\"da\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsNe("lang", VsStr("da"))))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"lang\":{\"\$eq\":\"da\"}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsLt("year", VsInt(2000))))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"year\":{\"\$gte\":2000}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsLte("year", VsInt(2000))))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"year\":{\"\$gt\":2000}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsGt("year", VsInt(2000))))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"year\":{\"\$lte\":2000}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsGte("year", VsInt(2000))))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"year\":{\"\$lt\":2000}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsIn("lang", [VsStr("da")])))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"lang\":{\"\$nin\":[\"da\"]}}")
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsContains("tags", VsStr("x"))))
+        Ok(v)  => test.assert(json.stringify(v) == "{\"tags\":{\"\$not_contains\":\"x\"}}")
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_three_clauses_chroma_has_no_operator_for_are_refused_by_name() [io]
+    // The module's disclosure, pinned: these are refusals and not
+    // silent approximations, and the name in the fault is the clause's.
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsPrefix("title", "ab")))
+        Err(f) => test.assert(str.contains(f.message(), "a prefix match on title"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsExists("tag")))
+        Err(f) => test.assert(str.contains(f.message(), "an existence test on tag"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsMissing("tag")))
+        Err(f) => test.assert(str.contains(f.message(), "an absence test on tag"))
+        Ok(_)  => test.assert(false)
+
+    test.case("and their negations are refused too, rather than standing in for something else")
+    match vshttp.encode_filter(VsChroma, VsNot(VsPrefix("title", "ab")))
+        Err(f) => test.assert(str.contains(f.message(), "a negated prefix match on title"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsExists("tag")))
+        Err(f) => test.assert(str.contains(f.message(), "the negation of an existence test on tag"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.encode_filter(VsChroma, VsNot(VsMissing("tag")))
+        Err(f) => test.assert(str.contains(f.message(), "the negation of an absence test on tag"))
+        Ok(_)  => test.assert(false)
+
+    test.case("while qdrant has all six")
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsPrefix("title", "ab")))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, VsNot(VsExists("tag")))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_filter_that_cannot_be_answered_is_refused_before_it_is_translated() [io]
+    test.case("an empty conjunction is not silently the whole corpus")
+    match vshttp.encode_filter(VsQdrant, vsfilter.all_of([]))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("and an empty disjunction is not silently nothing")
+    match vshttp.encode_filter(VsChroma, vsfilter.any_of([]))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("an ordering against a boolean, which neither server orders the same way")
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsGt("flag", VsBool(true))))
+        Err(f) => test.assert(str.contains(f.message(), "a boolean has no order"))
+        Ok(_)  => test.assert(false)
+
+    test.case("both servers refuse it, because the check runs before the translation")
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsGt("flag", VsBool(true))))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("and an empty IN, which matches nothing and is a list filtered to zero")
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsIn("lang", [])))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    test.case("a field that is not a dot path of names is not a field")
+    match vshttp.encode_filter(VsChroma, vsfilter.is_clause(VsEq("", VsInt(1))))
+        Err(f) => test.assert(str.contains(f.message(), "a dot path"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.encode_filter(VsQdrant, vsfilter.is_clause(VsEq("a..b", VsInt(1))))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+// ── the request bodies ──────────────────────────────────────────────
+
+@test
+fn test_a_search_body_asks_for_the_documents_and_the_vectors_back() [io]
+    match vshttp.encode_search(a_client(), vssearch.with_ef(vssearch.query([0.5, 0.25], 3), 64))
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.case("the qdrant body, with the candidate width the caller asked for")
+            test.assert(json.stringify(v) == "{\"vector\":[0.5,0.25],\"limit\":3,\"with_payload\":true,\"with_vector\":true,\"params\":{\"hnsw_ef\":64}}")
+
+    match vshttp.encode_search(a_client(), vssearch.query([0.5, 0.25], 3))
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.case("no ef, no params member: the server's own default is the default")
+            test.assert(json.stringify(v) == "{\"vector\":[0.5,0.25],\"limit\":3,\"with_payload\":true,\"with_vector\":true}")
+
+    match vshttp.encode_search(a_client(),
+                              vssearch.with_filter(vssearch.query([0.5], 2),
+                                                   vsfilter.is_clause(VsEq("lang", VsStr("da")))))
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.case("and a filter travels in `filter`")
+            test.assert(json.stringify(v) == "{\"vector\":[0.5],\"limit\":2,\"with_payload\":true,\"with_vector\":true,\"filter\":{\"key\":\"lang\",\"match\":{\"value\":\"da\"}}}")
+
+    test.case("a keyword-only query is qdrant's to run")
+    match vshttp.encode_search(a_client(), vssearch.text_query("denmark", 3))
+        Err(_) => test.assert(false)
+        Ok(v)  => test.assert(str.contains(json.stringify(v), "\"vector\":[]"))
+
+@test
+fn test_a_chroma_search_body_keeps_the_four_lists_side_by_side() [io]
+    match vshttp.encode_search(a_chroma_client(), vssearch.query([0.5, 0.25], 3))
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.case("one query, so one embedding in one inner list")
+            test.assert(json.stringify(v) == "{\"query_embeddings\":[[0.5,0.25]],\"n_results\":3,\"include\":[\"distances\",\"documents\",\"metadatas\"]}")
+
+    match vshttp.encode_search(a_chroma_client(),
+                              vssearch.with_filter(vssearch.query([0.5], 2),
+                                                   vsfilter.is_clause(VsEq("lang", VsStr("da")))))
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.case("and a filter travels in `where`, chroma's own key")
+            test.assert(json.stringify(v) == "{\"query_embeddings\":[[0.5]],\"n_results\":2,\"include\":[\"distances\",\"documents\",\"metadatas\"],\"where\":{\"lang\":{\"\$eq\":\"da\"}}}")
+
+@test
+fn test_a_query_the_dialect_cannot_run_is_refused_by_name() [io]
+    test.case("chroma has no sparse vectors, so a hybrid query is named and not trimmed")
+    match vshttp.encode_search(a_chroma_client(), vssearch.hybrid_query([0.5], "denmark", 3))
+        Err(f) => test.assert(str.contains(f.message(), "chroma has no sparse vectors"))
+        Ok(_)  => test.assert(false)
+
+    test.case("a chroma query with neither half is named too")
+    match vshttp.encode_search(a_chroma_client(), vssearch.query([], 3))
+        Err(f) => test.assert(str.contains(f.message(), "neither a vector nor a keyword half"))
+        Ok(_)  => test.assert(false)
+
+    test.case("a search for no results, in either dialect")
+    match vshttp.encode_search(a_client(), vssearch.query([0.5], 0))
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+    match vshttp.encode_search(a_chroma_client(), vssearch.query([0.5], 0 - 1))
+        Err(f) => test.assert(str.contains(f.message(), "a search for -1 results"))
+        Ok(_)  => test.assert(false)
+
+    test.case("and the check is published under its own name as well")
+    match vshttp.check_query(VsQdrant, vssearch.query([0.5], 3))
+        Ok(n)  => test.assert_eq(n, 3)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_query_from_another_model_is_refused_before_it_is_sent() [io]
+    // The check that costs nothing and catches the failure nothing else
+    // catches: two models of the same dimension are still two spaces.
+    let c = vshttp.with_model(a_client(), "text-embedding-3-small")
+
+    match vshttp.encode_search(c, vssearch.with_model(vssearch.query([0.5], 1), "text-embedding-3-small"))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    match vshttp.encode_search(c, vssearch.with_model(vssearch.query([0.5], 1), "another-model"))
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("the fault names both models")
+            test.assert(str.contains(f.message(), "another-model"))
+            test.assert(str.contains(f.message(), "text-embedding-3-small"))
+
+    test.case("a client that names no model checks nothing")
+    match vshttp.encode_search(a_client(), vssearch.with_model(vssearch.query([0.5], 1), "another-model"))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("and a query that names none is not checked")
+    match vshttp.encode_search(c, vssearch.query([0.5], 1))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_headers_a_caller_adds_are_added_to_the_client_not_to_the_world() [io]
+    let base = a_client()
+    let keyed = vshttp.with_header(base, "api-key", "secret")
+
+    test.assert_eq(list.len(keyed.headers), 1)
+    test.case("the client it came from is unchanged")
+    test.assert_eq(list.len(base.headers), 0)
+
+    test.case("and a model is added the same way")
+    let m = vshttp.with_model(keyed, "text-embedding-3-small")
+    test.assert(m.model == "text-embedding-3-small")
+    test.assert(keyed.model == "")
+    test.assert_eq(list.len(m.headers), 1)
+
+// ── documents in and out ────────────────────────────────────────────
+
+@test
+fn test_a_qdrant_upsert_body_is_points_with_a_payload() [io]
+    let meta = json.object([("year", json.int(2020)), ("text", json.string("not this"))])
+    let d = a_doc("notes/1", "denmark", [0.5, 0.25], meta)
+
+    match vshttp.encode_upsert(a_client(), [d])
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match json.get_list(v, "points")
+                None     => test.assert(false)
+                Some(ps) =>
+                    test.assert_eq(list.len(ps), 1)
+                    match list.first(ps)
+                        None    => test.assert(false)
+                        Some(p) =>
+                            test.case("the point id is the one qdrant will accept")
+                            test.assert((json.get_str(p, "id") ?? "") == vshttp.point_id(VsQdrant, "notes/1"))
+                            test.case("the vector travels as numbers")
+                            test.assert(json.stringify(json.get(p, "vector") ?? json.null()) == "[0.5,0.25]")
+                            let payload = json.get(p, "payload") ?? json.object([])
+                            test.case("the metadata is the payload, plus the two reserved keys")
+                            test.assert_eq(json.get_int(payload, "year") ?? 0, 2020)
+                            test.assert((json.get_str(payload, "id") ?? "") == "notes/1")
+                            test.case("a metadata key named `text` does not overwrite the document's own")
+                            test.assert((json.get_str(payload, "text") ?? "") == "denmark")
+
+    test.case("a UUID id qdrant accepts as it stands is not hashed")
+    let u = "9f8d3c2b-1a4e-4c6d-8f0e-2b3a4c5d6e7f"
+    match vshttp.encode_upsert(a_client(), [vsdoc.doc(u, "sweden", [0.5])])
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            match json.get_list(v, "points")
+                None     => test.assert(false)
+                Some(ps) =>
+                    match list.first(ps)
+                        Some(p) => test.assert((json.get_str(p, "id") ?? "") == u)
+                        None    => test.assert(false)
+
+@test
+fn test_a_chroma_upsert_body_is_four_lists_side_by_side() [io]
+    // chroma's text is its own `documents` field rather than a metadata
+    // key, and its metadata passes through unchanged.
+    let meta = json.object([("year", json.int(2020)), ("text", json.string("not this"))])
+    let d = a_doc("notes/1", "denmark", [0.5, 0.25], meta)
+
+    match vshttp.encode_upsert(a_chroma_client(), [d])
+        Err(_) => test.assert(false)
+        Ok(v)  =>
+            test.case("chroma takes any string as an id, so the caller's own travels")
+            test.assert(json.stringify(v) == "{\"ids\":[\"notes/1\"],\"embeddings\":[[0.5,0.25]],\"documents\":[\"denmark\"],\"metadatas\":[{\"year\":2020,\"text\":\"not this\"}]}")
+
+@test
+fn test_a_qdrant_point_becomes_a_document_field_by_field() [io]
+    let point = json.object([
+        ("id", json.int(7)),
+        ("payload", json.object([("year", json.int(2020)),
+                                 ("id", json.string("notes/1")),
+                                 ("text", json.string("denmark"))])),
+        ("vector", json.array([json.float(0.5), json.float(0.25)]))])
+
+    let d = vshttp.qdrant_doc(point)
+    test.case("the caller's id is the payload's, not the point id qdrant made up")
+    test.assert(d.id == "notes/1")
+    test.assert(d.text == "denmark")
+    test.assert_eq(json.get_int(d.metadata, "year") ?? 0, 2020)
+    test.case("the reserved keys are not metadata")
+    test.assert(not has(d.metadata, "id"))
+    test.assert(not has(d.metadata, "text"))
+    test.assert_eq(list.len(d.vector), 2)
+
+    test.case("a point with no payload at all falls back to the point id, as text")
+    let bare = json.object([("id", json.int(7)), ("vector", json.array([]))])
+    let b = vshttp.qdrant_doc(bare)
+    test.assert(b.id == "7")
+    test.assert(str.is_empty(b.text))
+    test.assert(json.type_of(b.metadata) == "object")
+
+    test.case("and a point with no id either reads as the zero id, not a crash")
+    let none = vshttp.qdrant_doc(json.object([("vector", json.array([]))]))
+    test.assert(none.id == "0")
+
+    test.case("a vector coordinate that is not a number reads as zero")
+    let mixed = vshttp.qdrant_doc(json.object([("vector", json.array([json.float(0.5), json.string("x")]))]))
+    test.assert_eq(list.len(mixed.vector), 2)
+    test.assert_eq(list.get(mixed.vector, 1, 0.0 - 1.0), 0.0)
+
+@test
+fn test_a_qdrant_reply_becomes_hits_with_the_score_as_the_similarity_it_is() [io]
+    let body = json.stringify(json.object([
+        ("result", json.array([
+            json.object([("id", json.int(7)),
+                         ("score", json.float(0.75)),
+                         ("payload", json.object([("id", json.string("notes/1")),
+                                                  ("text", json.string("denmark"))]))]),
+            json.object([("id", json.string("notes/2")),
+                         ("score", json.float(0.25)),
+                         ("payload", json.object([]))])]))]))
+
+    match vshttp.decode_search(a_client(), body)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.assert_eq(list.len(o.hits), 2)
+            match list.first(o.hits)
+                None    => test.assert(false)
+                Some(h) =>
+                    test.case("the rank is the position the server put it in")
+                    match h.source
+                        VsFromVector(r) => test.assert_eq(r, 1)
+                        _               => test.assert(false)
+                    test.assert(h.id == "notes/1")
+                    test.case("the score is the similarity the server ranked by")
+                    test.assert_eq(h.score, 0.75)
+                    test.assert_eq(h.distance, 0.25)
+
+            let second = list.get(o.hits, 1, a_sentinel_hit())
+            test.case("a second point, a second rank")
+            test.assert(second.id == "notes/2")
+            match second.source
+                VsFromVector(r) => test.assert_eq(r, 2)
+                _               => test.assert(false)
+
+            test.case("neither server says a filtered search was exhaustive, so it never claims one was")
+            test.assert(not o.exhaustive)
+            match o.plan
+                VsFilteredTraversal => test.assert(true)
+                _                   => test.assert(false)
+            test.case("and the cost accounting is what came back, not what was walked")
+            test.assert_eq(o.examined, 2)
+            test.assert_eq(o.filtered_out, 0)
+
+@test
+fn test_a_chroma_reply_answers_distances_so_the_score_is_undone() [io]
+    // Getting this wrong is a store that returns the furthest documents
+    // and looks like it works.
+    let body = json.stringify(json.object([
+        ("ids", json.array([json.array([json.string("notes/1"), json.string("notes/2")])])),
+        ("distances", json.array([json.array([json.float(0.25), json.float(0.75)])]))]))
+
+    match vshttp.decode_search(a_chroma_client(), body)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.assert_eq(list.len(o.hits), 2)
+            match list.first(o.hits)
+                None    => test.assert(false)
+                Some(h) =>
+                    test.assert(h.id == "notes/1")
+                    test.case("the distance is kept and the score is 1 - distance")
+                    test.assert_eq(h.distance, 0.25)
+                    test.assert_eq(h.score, 0.75)
+                    match h.source
+                        VsFromVector(r) => test.assert_eq(r, 1)
+                        _               => test.assert(false)
+            let second = list.get(o.hits, 1, a_sentinel_hit())
+            test.assert(second.id == "notes/2")
+            test.assert_eq(second.distance, 0.75)
+            test.assert_eq(second.score, 0.25)
+
+            test.case("and the same non-claim of exhaustiveness as qdrant")
+            test.assert(not o.exhaustive)
+            match o.plan
+                VsFilteredTraversal => test.assert(true)
+                _                   => test.assert(false)
+
+@test
+fn test_a_reply_that_is_not_the_shape_it_promised_is_a_fault() [io]
+    test.case("qdrant: not JSON at all")
+    match vshttp.decode_search(a_client(), "not json at all")
+        Err(f) => test.assert(str.contains(f.message(), "JSON object"))
+        Ok(_)  => test.assert(false)
+
+    test.case("qdrant: JSON with no result list")
+    match vshttp.decode_search(a_client(), "{\"other\":1}")
+        Err(f) => test.assert(str.contains(f.message(), "result list"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.decode_get(a_client(), "{\"result\":{}}")
+        Err(f) => test.assert(str.contains(f.message(), "result list"))
+        Ok(_)  => test.assert(false)
+
+    test.case("chroma: no ids at all")
+    match vshttp.decode_search(a_chroma_client(), "{}")
+        Err(f) => test.assert(str.contains(f.message(), "ids list"))
+        Ok(_)  => test.assert(false)
+
+    test.case("chroma: an empty page is a server answering nothing for one query")
+    match vshttp.decode_search(a_chroma_client(), "{\"ids\":[]}")
+        Err(f) => test.assert(str.contains(f.message(), "a page in it"))
+        Ok(_)  => test.assert(false)
+
+    test.case("chroma: ids that are not a list of lists")
+    match vshttp.decode_search(a_chroma_client(), "{\"ids\":[\"a\"]}")
+        Err(f) => test.assert(str.contains(f.message(), "ids list of lists"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.decode_get(a_chroma_client(), "{\"documents\":[]}")
+        Err(f) => test.assert(str.contains(f.message(), "ids list"))
+        Ok(_)  => test.assert(false)
+
+@test
+fn test_a_chroma_get_answers_the_lists_it_was_asked_for_and_no_others() [io]
+    let full = "{\"ids\":[\"notes/1\"],\"documents\":[\"denmark\"],\"metadatas\":[{\"year\":2020}],\"embeddings\":[[0.5,0.25]]}"
+    match vshttp.decode_get(a_chroma_client(), full)
+        Err(_)   => test.assert(false)
+        Ok(docs) =>
+            match list.first(docs)
+                None    => test.assert(false)
+                Some(d) =>
+                    test.assert(d.id == "notes/1")
+                    test.assert(d.text == "denmark")
+                    test.assert_eq(json.get_int(d.metadata, "year") ?? 0, 2020)
+                    test.assert_eq(list.len(d.vector), 2)
+
+    test.case("a get asks for what it wants, so the three after ids may be missing")
+    match vshttp.decode_get(a_chroma_client(), "{\"ids\":[\"notes/1\"]}")
+        Err(_)   => test.assert(false)
+        Ok(docs) =>
+            match list.first(docs)
+                None    => test.assert(false)
+                Some(d) =>
+                    test.assert(d.id == "notes/1")
+                    test.assert(str.is_empty(d.text))
+                    test.assert(json.type_of(d.metadata) == "object")
+                    test.assert_eq(list.len(d.vector), 0)
+
+    test.case("and an embeddings row that is not a row is an empty vector")
+    match vshttp.decode_get(a_chroma_client(), "{\"ids\":[\"a\"],\"embeddings\":[\"nope\"]}")
+        Err(_)   => test.assert(false)
+        Ok(docs) =>
+            match list.first(docs)
+                Some(d) => test.assert_eq(list.len(d.vector), 0)
+                None    => test.assert(false)
+
+@test
+fn test_a_server_answers_in_its_order_and_the_store_answers_in_the_asked_order() [io]
+    let body = json.stringify(json.object([
+        ("result", json.array([
+            json.object([("id", json.int(2)),
+        ("payload", json.object([("id", json.string("b"))])),
+        ("vector", json.array([]))]),
+            json.object([("id", json.int(1)),
+        ("payload", json.object([("id", json.string("a"))])),
+        ("vector", json.array([]))])]))]))
+
+    match vshttp.decode_get(a_client(), body)
+        Err(_)   => test.assert(false)
+        Ok(docs) =>
+            test.case("the server answered b then a")
+            match list.first(docs)
+                Some(d) => test.assert(d.id == "b")
+                None    => test.assert(false)
+
+            test.case("and asked for a then b, the answer is a then b")
+            let ordered = vshttp.in_order(docs, ["a", "b"])
+            test.assert_eq(list.len(ordered), 2)
+            match list.first(ordered)
+                Some(d) => test.assert(d.id == "a")
+                None    => test.assert(false)
+
+            test.case("an id the server did not answer is skipped, not invented")
+            test.assert_eq(list.len(vshttp.in_order(docs, ["a", "zz"])), 1)
+            test.assert_eq(list.len(vshttp.in_order(docs, [])), 0)
+
+// ── the small answers ───────────────────────────────────────────────
+
+@test
+fn test_a_server_error_becomes_the_dialect_s_own_sentence() [io]
+    test.case("qdrant puts its sentence inside status.error")
+    let f = vshttp.decode_error(VsQdrant, 404, "{\"status\":{\"error\":\"Collection notes not found\"}}")
+    test.assert(str.contains(f.message(), "404"))
+    test.assert(str.contains(f.message(), "Collection notes not found"))
+    test.assert(not vsfault.is_retryable(f))
+
+    test.case("a 5xx is worth trying again, which is the difference decode_error exists for")
+    test.assert(vsfault.is_retryable(vshttp.decode_error(VsQdrant, 503, "")))
+
+    test.case("a qdrant body that is not qdrant's is carried through as it stands")
+    let relay = vshttp.decode_error(VsQdrant, 502, "bad gateway")
+    test.assert(str.contains(relay.message(), "bad gateway"))
+    test.assert(vsfault.is_retryable(relay))
+
+    test.case("chroma names a code and a sentence")
+    let h = vshttp.decode_error(VsChroma, 400,
+        "{\"error\":\"InvalidArgument\",\"message\":\"Expected where to have exactly one operator\"}")
+    test.assert(str.contains(h.message(), "400"))
+    test.assert(str.contains(h.message(), "InvalidArgument"))
+    test.assert(str.contains(h.message(), "Expected where to have exactly one operator"))
+    test.assert(not vsfault.is_retryable(h))
+
+    test.case("and a chroma body that is not chroma's is carried through too")
+    let body = vshttp.decode_error(VsChroma, 500, "upstream timeout")
+    test.assert(str.contains(body.message(), "upstream timeout"))
+
+    test.case("a qdrant body with no `status` member is carried through whole")
+    let bare = vshttp.decode_error(VsQdrant, 500, "{\"a\":1}")
+    test.assert(str.contains(bare.message(), "500"))
+    test.assert(str.contains(bare.message(), "{\"a\":1}"))
+    test.assert(vsfault.is_retryable(bare))
+
+    test.case("and so is a `status` member with no sentence inside it")
+    let wordless = vshttp.decode_error(VsQdrant, 500, "{\"status\":{\"x\":1}}")
+    test.assert(str.contains(wordless.message(), "500"))
+    test.assert(str.contains(wordless.message(), "{\"status\":{\"x\":1}}"))
+
+@test
+fn test_the_cursor_a_scroll_hands_back_is_the_server_s_own() [io]
+    test.case("a qdrant page with nothing after it")
+    test.assert(str.is_empty(vshttp.next_cursor(json.object([("next_page_offset", json.null())]))))
+    test.case("a page with more to come carries the next offset, as text")
+    test.assert(vshttp.next_cursor(json.object([("next_page_offset", json.int(42))])) == "42")
+    test.case("and a reply that says nothing about a next page is the end")
+    test.assert(str.is_empty(vshttp.next_cursor(json.object([]))))
+
+@test
+fn test_the_three_small_flags_a_server_answers_with() [io]
+    test.case("qdrant says whether a creation created")
+    match vshttp.created_flag("{\"result\":true}")
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+
+    match vshttp.created_flag("{\"result\":false}")
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    test.case("a 200 whose body is not qdrant's is taken as a creation")
+    match vshttp.created_flag("not json")
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+
+    match vshttp.created_flag("{\"other\":1}")
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+
+    test.case("and a count in chroma's own body")
+    match vshttp.count_in_json("{\"count\":7}")
+        Ok(n)  => test.assert_eq(n, 7)
+        Err(_) => test.assert(false)
+
+    match vshttp.count_in_json("{}")
+        Err(f) => test.assert(str.contains(f.message(), "count"))
+        Ok(_)  => test.assert(false)
+
+    match vshttp.count_in_json("not json")
+        Err(_) => test.assert(true)
+        Ok(_)  => test.assert(false)
+
+@test
+fn test_a_delete_names_the_documents_the_server_knows() [io]
+    let docs = [vsdoc.doc("notes/1", "denmark", [0.5])]
+
+    test.case("qdrant deletes points, by the ids it gave them")
+    match json.get_list(vshttp.delete_body(VsQdrant, docs), "points")
+        None      => test.assert(false)
+        Some(ids) =>
+            test.assert_eq(list.len(ids), 1)
+            match list.first(ids)
+                Some(id) => test.assert((json.to_str(id) ?? "") == vshttp.point_id(VsQdrant, "notes/1"))
+                None     => test.assert(false)
+
+    test.case("chroma deletes ids, and the id is the caller's own")
+    match json.get_list(vshttp.delete_body(VsChroma, docs), "ids")
+        None      => test.assert(false)
+        Some(ids) =>
+            match list.first(ids)
+                Some(id) => test.assert((json.to_str(id) ?? "") == "notes/1")
+                None     => test.assert(false)
+
+// ── the frames on the wire ──────────────────────────────────────────
+
+@test
+fn test_the_id_qdrant_needs_is_an_integer_a_uuid_or_a_stable_hash() [io]
+    test.case("digits are an id qdrant takes as it stands")
+    test.assert(vshttp.point_id(VsQdrant, "42") == "42")
+    test.assert(vshttp.point_id(VsQdrant, "0012") == "0012")
+
+    test.case("so is a UUID, whatever its case")
+    test.assert(vshttp.point_id(VsQdrant, "9f8d3c2b-1a4e-4c6d-8f0e-2b3a4c5d6e7f")
+             == "9f8d3c2b-1a4e-4c6d-8f0e-2b3a4c5d6e7f")
+    test.assert(vshttp.point_id(VsQdrant, "9F8D3C2B-1A4E-4C6D-8F0E-2B3A4C5D6E7F")
+             == "9F8D3C2B-1A4E-4C6D-8F0E-2B3A4C5D6E7F")
+
+    test.case("chroma takes any string, so nothing is hashed there")
+    test.assert(vshttp.point_id(VsChroma, "notes/1") == "notes/1")
+
+    test.case("a caller's own id is hashed into one qdrant accepts")
+    let u = vshttp.point_id(VsQdrant, "notes/1")
+    test.assert(str.len(u) == 36)
+    test.assert(vshttp.is_uuid_shape(u))
+    test.assert(u != "notes/1")
+    test.assert(str.contains(u, "-"))
+
+    test.case("the same id is the same point in every call and every process")
+    test.assert(vshttp.point_id(VsQdrant, "notes/1") == u)
+    test.assert(vshttp.point_id(VsQdrant, "notes/2") != u)
+
+    test.case("the version nibble says RFC 9562 custom, not v5")
+    test.assert(str.slice(u, 14, 15) == "8")
+
+    test.case("and the variant nibble is in the range a UUID's variant may hold")
+    let v = str.slice(u, 19, 20)
+    test.assert(v == "8" or v == "9" or v == "a" or v == "b")
+
+@test
+fn test_what_qdrant_will_and_will_not_take_as_a_point_id() [io]
+    test.assert(vshttp.is_plain_point_id("42"))
+    test.assert(not vshttp.is_plain_point_id(""))
+    test.assert(not vshttp.is_plain_point_id("4a"))
+    test.assert(not vshttp.is_plain_point_id("-4"))
+    test.assert(not vshttp.is_plain_point_id("4.0"))
+
+    test.case("a UUID shape is lengths and hex digits")
+    test.assert(vshttp.is_uuid_shape("9f8d3c2b-1a4e-4c6d-8f0e-2b3a4c5d6e7f"))
+    test.assert(not vshttp.is_uuid_shape("9f8d3c2b-1a4e-4c6d-8f0e-2b3a4c5d6e7"))
+    test.assert(not vshttp.is_uuid_shape("9f8d3c2b1a4e4c6d8f0e2b3a4c5d6e7f-"))
+    test.assert(not vshttp.is_uuid_shape("9f8d3c2b-1a4e-4c6d-8f0e-2b3a4c5d6e7g"))
+    test.assert(not vshttp.is_uuid_shape(""))
+    test.assert(not vshttp.is_uuid_shape("9f8d3c2-1a4e-4c6d-8f0e-2b3a4c5d6e7f"))
+
+    test.case("the hash is built out of these pieces")
+    test.assert(vshttp.hex32(255) == "000000ff")
+    test.assert_eq(vshttp.hex_value("7"), 7)
+    test.assert_eq(vshttp.hex_value("f"), 15)
+    test.assert(vshttp.variant_of("0") == "8")
+    test.assert(vshttp.variant_of("f") == "b")
+    test.assert(vshttp.mix("a", 17) == vshttp.mix("a", 17))
+
+@test
+fn test_a_base_url_becomes_the_four_parts_the_transport_needs() [io]
+    match vshttp.endpoint_of("http://localhost:6333", 6333)
+        Err(_) => test.assert(false)
+        Ok(ep) =>
+            test.assert(not ep.secure)
+            test.assert(ep.host == "localhost")
+            test.assert_eq(ep.port, 6333)
+            test.assert(str.is_empty(ep.prefix))
+
+    test.case("https is the secure half, and the port is the dialect's default")
+    match vshttp.endpoint_of("https://qdrant.example", 6333)
+        Err(_) => test.assert(false)
+        Ok(ep) =>
+            test.assert(ep.secure)
+            test.assert(ep.host == "qdrant.example")
+            test.assert_eq(ep.port, 6333)
+
+    test.case("a prefix the collection is mounted under, without its trailing slash")
+    match vshttp.endpoint_of("http://gateway.example/qdrant/", 6333)
+        Err(_) => test.assert(false)
+        Ok(ep) =>
+            test.assert(ep.host == "gateway.example")
+            test.assert(ep.prefix == "/qdrant")
+
+    test.case("and the same mount written without the slash is the same prefix")
+    match vshttp.endpoint_of("http://gateway.example/qdrant", 6333)
+        Err(_) => test.assert(false)
+        Ok(ep) =>
+            test.assert(ep.prefix == "/qdrant")
+            test.assert_eq(ep.port, 6333)
+
+    test.case("a URL that is not http or https is refused, by name")
+    match vshttp.endpoint_of("ftp://localhost", 6333)
+        Err(f) => test.assert(str.contains(f.message(), "ftp://localhost"))
+        Ok(_)  => test.assert(false)
+
+    test.case("and so is a port that is not a number")
+    match vshttp.endpoint_of("http://localhost:port", 6333)
+        Err(f) => test.assert(str.contains(f.message(), "is not a port"))
+        Ok(_)  => test.assert(false)
+
+@test
+fn test_a_request_head_says_where_it_goes_and_how_long_the_body_is() [io]
+    match vshttp.endpoint_of("http://localhost:6333", 6333)
+        Err(_) => test.assert(false)
+        Ok(ep) =>
+            let head = vshttp.request_head(a_client(), ep, "POST",
+                                           "/collections/notes/points/search", "{\"a\":1}")
+            test.assert(str.starts_with(head, "POST /collections/notes/points/search HTTP/1.1\r\n"))
+            test.assert(str.contains(head, "Host: localhost:6333\r\n"))
+            test.assert(str.contains(head, "Content-Type: application/json\r\n"))
+            test.case("the length is the body's, in bytes")
+            test.assert(str.contains(head, "Content-Length: 7\r\n"))
+            test.case("the connection is closed, which is what makes the second half of the reply readable")
+            test.assert(str.contains(head, "Connection: close\r\n"))
+            test.assert(str.ends_with(head, "\r\n\r\n"))
+
+    test.case("a caller's headers ride along, and the prefix rides in front of the path")
+    let keyed = vshttp.with_header(a_client(), "api-key", "secret")
+    match vshttp.endpoint_of("http://gateway.example/qdrant/", 6333)
+        Err(_) => test.assert(false)
+        Ok(ep) =>
+            let head = vshttp.request_head(keyed, ep, "GET", "/collections/notes", "")
+            test.assert(str.starts_with(head, "GET /qdrant/collections/notes HTTP/1.1\r\n"))
+            test.assert(str.contains(head, "api-key: secret\r\n"))
+            test.assert(str.contains(head, "Content-Length: 0\r\n"))
+
+@test
+fn test_a_reply_is_cut_to_the_length_its_header_states() [io]
+    // The socket is read to its end, so anything the server or a proxy
+    // wrote after the body would otherwise be handed to the JSON parser
+    // as part of it.
+    match vshttp.split_reply("HTTP/1.1 200 OK\r\nContent-Length: 7\r\n\r\n{\"a\":1}trailing")
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.assert_eq(r.status, 200)
+            test.assert(r.body == "{\"a\":1}")
+
+    test.case("no content-length leaves the body as it arrived")
+    match vshttp.split_reply("HTTP/1.1 204 No Content\r\nX-Thing: 1\r\n\r\n")
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(str.is_empty(r.body))
+
+    test.case("a length longer than the body is not a cut to nothing")
+    match vshttp.split_reply("HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\nbody")
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(r.body == "body")
+
+    test.case("and neither is a length that is not a number")
+    match vshttp.split_reply("HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nbody")
+        Err(_) => test.assert(false)
+        Ok(r)  => test.assert(r.body == "body")
+
+    test.case("a header name is found whatever its case")
+    match vshttp.header_value("HTTP/1.1 200 OK\r\nCONTENT-LENGTH: 3", "content-length")
+        Some(v) => test.assert(v == " 3")
+        None    => test.assert(false)
+
+    test.case("and one that is not there is nothing")
+    match vshttp.header_value("HTTP/1.1 200 OK\r\nX-Thing: 1", "content-length")
+        Some(_) => test.assert(false)
+        None    => test.assert(true)
+
+    test.case("a reply with no header terminator is malformed")
+    match vshttp.split_reply("HTTP/1.1 200 OK\n\n{}")
+        Err(f) => test.assert(str.contains(f.message(), "HTTP header terminator"))
+        Ok(_)  => test.assert(false)
+
+    test.case("a reply whose first line holds no code is malformed")
+    match vshttp.split_reply("\r\n\r\n{}")
+        Err(f) => test.assert(str.contains(f.message(), "status code in"))
+        Ok(_)  => test.assert(false)
+
+    test.case("and a status line with no code in it is malformed")
+    match vshttp.split_reply("HTTP/1.1\r\n\r\n")
+        Err(f) => test.assert(str.contains(f.message(), "status code in HTTP/1.1"))
+        Ok(_)  => test.assert(false)
+
+// ── the transport's refusal arm ─────────────────────────────────────
+
+@test
+fn test_a_connection_that_is_not_there_is_a_fault_that_names_the_address() [io, net]
+    // Port 1 on the loopback has nothing behind it, which is the one
+    // peer a test may assume.
+    match vshttp.vs_connect("127.0.0.1", 1, false)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.assert(str.contains(f.message(), "127.0.0.1:1"))
+            test.assert(vsfault.is_retryable(f))
+
+    test.case("and the TLS half refuses the same way, with its own error")
+    match vshttp.vs_connect("127.0.0.1", 1, true)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "the TLS connection to 127.0.0.1:1 failed"))
+
+@test
+fn test_every_method_of_the_remote_store_refuses_before_a_request_is_sent() [io, net]
+    let q = vshttp.qdrant("http://127.0.0.1:1", "notes")
+    let c = vshttp.chroma("http://127.0.0.1:1", "notes")
+
+    match q.vs_search(vssearch.query([0.5], 1))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(vsfault.is_retryable(f))
+
+    test.case("an upsert builds its body, then does not send it")
+    match q.vs_upsert([vsdoc.doc("a", "denmark", [0.5])])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a delete reads first, and the read is what fails")
+    match q.vs_delete(["a"])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a get, on both dialects, and a count")
+    match q.vs_get(["a"])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match c.vs_get(["a"])
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match q.vs_count()
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match c.vs_count()
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a page of no size is refused before the socket is opened")
+    match vshttp.scroll(q, "", 0)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a chroma scroll reads its cursor before it sends anything")
+    match vshttp.scroll(c, "8", 16)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+// ── the transport, with a server on the other end ───────────────────
+
+// One accepted connection served: the request read to its own end, then
+// the reply, then the close.
+//
+// The transport opens one connection per request, sends it in one write
+// and then reads to the socket's end.  So the request is whole once the
+// client stops writing, and a read that comes back empty after the
+// socket's own short deadline is that end rather than the start of the
+// next request.
+fn serve_once(server: Sock, reply: Str) -> Str [net]
+    match net.accept(server)
+        None               => ""
+        Some((peer, addr)) =>
+            let _ = net.set_recv_timeout(peer, 150)
+            var got = ""
+            var going = true
+            while going
+                match net.recv(peer, 8192)
+                    None        =>
+                        going = false
+                    Some(chunk) =>
+                        if str.is_empty(chunk)
+                            going = false
+                        else
+                            got = got + chunk
+            let _ = net.send(peer, reply)
+            net.close(peer)
+            got
+
+// A reply in the frame `split_reply` reads.
+fn a_reply(status: Int, body: Str) -> Str []
+    "HTTP/1.1 ${status} OK\r\nContent-Length: ${str.len(body)}\r\n\r\n${body}"
+
+// The request's first line, which is the method and the path.
+fn request_line(got: Str) -> Str []
+    str.trim(list.get(str.split_lines(got), 0, ""))
+
+// Whether a document list carries this id.
+fn carries(docs: [VsDoc], id: Str) -> Bool []
+    var found = false
+    for d in docs
+        if d.id == id
+            found = true
+    found
+
+// Whether a hit list carries this id.
+fn struck(hits: [VsHit], id: Str) -> Bool []
+    var found = false
+    for h in hits
+        if h.id == id
+            found = true
+    found
+
+// A qdrant point as the server writes one: the id, the score, and the
+// payload a document is read back out of.
+fn a_point(id: Str, text: Str) -> Str []
+    "{\"id\":\"${id}\",\"score\":0.75,\"payload\":{\"text\":\"${text}\",\"tag\":\"a\"},\"vector\":[0.5,0.5]}"
+
+// A chroma row as the server writes one: the four lists side by side,
+// one entry in each.
+fn a_chroma_row(id: Str, text: Str) -> Str []
+    "{\"ids\":[\"${id}\"],\"documents\":[\"${text}\"],\"metadatas\":[{\"tag\":\"a\"}],\"embeddings\":[[0.5,0.5]]}"
+
+// The client half of the loopback test: every method of the remote
+// store, one call after another, against the listener the test itself
+// serves.
+//
+// Only an Int crosses a cell boundary, so the answer is a bitmask — one
+// bit per call, set when that call answered what the served reply says.
+// A wrong total therefore names the calls that disagreed.
+fn drive_both_clients(port: Int) -> Int [net, time]
+    let q = vshttp.qdrant("http://127.0.0.1:${port}", "notes")
+    let k = vshttp.chroma("http://127.0.0.1:${port}", "notes")
+    let p = vshttp.qdrant("http://127.0.0.1:${port}/qdrant", "notes")
+    let cfg = vsdoc.config(2, HnswCosine, "test-model",
+                           hnswparam.default_params(2, HnswCosine)!)
+    var ok = 0
+
+    // qdrant, one bit per call, in the order the test serves them.
+    match vshttp.health(q)
+        Ok(true) =>
+            ok = ok + 1
+        _        => ()
+    match vshttp.health(q)
+        Ok(false) =>
+            ok = ok + 2
+        _         => ()
+    match vshttp.ensure_collection(q, cfg)
+        Ok(true) =>
+            ok = ok + 4
+        _        => ()
+    match vshttp.ensure_collection(q, cfg)
+        Ok(false) =>
+            ok = ok + 8
+        _         => ()
+    match vshttp.ensure_collection(q, cfg)
+        Ok(false) =>
+            ok = ok + 16
+        _         => ()
+    match q.vs_upsert([vsdoc.doc("d1", "denmark", [0.5, 0.5])])
+        Ok(1) =>
+            ok = ok + 32
+        _     => ()
+    match q.vs_get(["d1"])
+        Ok(ds) =>
+            if carries(ds, "d1")
+                ok = ok + 64
+        _      => ()
+    match q.vs_count()
+        Ok(3) =>
+            ok = ok + 128
+        _     => ()
+    match vshttp.scroll(q, "", 5)
+        Ok(page) =>
+            if carries(page.docs, "d1") and str.is_empty(page.next)
+                ok = ok + 256
+        _        => ()
+    match vshttp.scroll(q, "7", 5)
+        Ok(page) =>
+            if page.next == "7"
+                ok = ok + 512
+        _        => ()
+    match q.vs_search(vssearch.query([0.5, 0.5], 1))
+        Ok(o) =>
+            if list.len(o.hits) == 1 and struck(o.hits, "d1")
+                ok = ok + 1024
+        _     => ()
+    match vshttp.scroll(q, "", 5)
+        Err(_) =>
+            ok = ok + 2048
+        _      => ()
+    match q.vs_delete(["d1"])
+        Ok(1) =>
+            ok = ok + 4096
+        _     => ()
+    match vshttp.health(q)
+        Err(_) =>
+            ok = ok + 8192
+        _      => ()
+    match vshttp.health(q)
+        Err(_) =>
+            ok = ok + 16384
+        _      => ()
+
+    // chroma.
+    match vshttp.health(k)
+        Ok(true) =>
+            ok = ok + 32768
+        _        => ()
+    match vshttp.health(k)
+        Ok(false) =>
+            ok = ok + 65536
+        _         => ()
+    match vshttp.health(k)
+        Err(_) =>
+            ok = ok + 131072
+        _      => ()
+    match vshttp.ensure_collection(k, cfg)
+        Ok(true) =>
+            ok = ok + 262144
+        _        => ()
+    match vshttp.ensure_collection(k, cfg)
+        Ok(false) =>
+            ok = ok + 524288
+        _         => ()
+    match vshttp.ensure_collection(k, cfg)
+        Err(_) =>
+            ok = ok + 1048576
+        _      => ()
+    match k.vs_get(["d1"])
+        Ok(ds) =>
+            if carries(ds, "d1")
+                ok = ok + 2097152
+        _      => ()
+    match k.vs_count()
+        Ok(3) =>
+            ok = ok + 4194304
+        _     => ()
+    match k.vs_count()
+        Ok(3) =>
+            ok = ok + 8388608
+        _     => ()
+    match vshttp.scroll(k, "", 5)
+        Ok(page) =>
+            if carries(page.docs, "d1") and str.is_empty(page.next)
+                ok = ok + 16777216
+        _        => ()
+    match vshttp.scroll(k, "0", 1)
+        Ok(page) =>
+            if carries(page.docs, "d2") and page.next == "1"
+                ok = ok + 33554432
+        _        => ()
+
+    // The same dialect behind a base URL that mounts it under a prefix:
+    // the prefix rides in front of the dialect's own path.
+    match p.vs_count()
+        Ok(3) =>
+            ok = ok + 67108864
+        _     => ()
+
+    // The readers a served answer can still starve: every remaining
+    // branch below is the `None` arm of a member the body did not
+    // carry, and each is answered by a body of exactly that shape.
+    match vshttp.ensure_collection(q, cfg)
+        Err(_) =>
+            ok = ok + 134217728
+        _      => ()
+    match vshttp.scroll(q, "", 5)
+        Err(_) =>
+            ok = ok + 268435456
+        _      => ()
+    match vshttp.scroll(q, "", 5)
+        Err(_) =>
+            ok = ok + 536870912
+        _      => ()
+    match q.vs_delete(["nope"])
+        Ok(0) =>
+            ok = ok + 1073741824
+        _     => ()
+    match q.vs_count()
+        Err(_) =>
+            ok = ok + 2147483648
+        _      => ()
+    match q.vs_count()
+        Err(_) =>
+            ok = ok + 4294967296
+        _      => ()
+    ok
+
+@test
+fn test_the_transport_answers_a_real_server_on_the_loopback() [io, net, time, ipc]
+    // The arms a canned reply cannot reach: a connection the kernel
+    // accepts, a request real bytes are written to, and a real reply
+    // read to the socket's end and cut to its own stated length.
+    //
+    // The client half runs in a worker cell, because the test cell is
+    // the server.  The two halves interleave one request at a time —
+    // each call blocks until its reply arrives and each serve blocks
+    // until the next request does — so the order below IS the order the
+    // worker sends in.
+    test.case("a port the kernel picks, so two runs of this cannot collide")
+    match net.listen_on("127.0.0.1", 0)
+        None         => test.assert(false)
+        Some(server) =>
+            let port = net.local_port(server)
+            test.assert(port > 0)
+            let h = cell.spawn(drive_both_clients, port)
+            test.assert(h != 0)
+
+            test.case("qdrant: a health check reads the status, not the body")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"result\":{}}")))
+                        == "GET /collections/notes HTTP/1.1")
+            test.case("a 404 is a collection that is not there rather than a fault")
+            test.assert(request_line(
+                serve_once(server, a_reply(404, "{\"status\":{\"error\":\"not found\"}}")))
+                        == "GET /collections/notes HTTP/1.1")
+            test.case("creating a collection is a PUT of the config")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"result\":true}")))
+                        == "PUT /collections/notes HTTP/1.1")
+            test.case("and `result: false` is the server saying it was already there")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"result\":false}")))
+                        == "PUT /collections/notes HTTP/1.1")
+            test.case("a 409 says the same thing without a body to read")
+            test.assert(request_line(
+                serve_once(server, a_reply(409, "{\"status\":{\"error\":\"already exists\"}}")))
+                        == "PUT /collections/notes HTTP/1.1")
+            test.case("an upsert is points, and the count is what was sent")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":{\"status\":\"completed\"}}")))
+                        == "POST /collections/notes/points/upsert HTTP/1.1")
+            test.case("a get asks for the points by the ids the server gave them")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":["
+                                       + a_point("d1", "denmark") + "]}")))
+                        == "POST /collections/notes/points HTTP/1.1")
+            test.case("a count is exact, not qdrant's estimate")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":{\"count\":3}}")))
+                        == "POST /collections/notes/points/count HTTP/1.1")
+            test.case("a scroll with no cursor sends no offset")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":{\"points\":["
+                                       + a_point("d1", "denmark") + "]}}")))
+                        == "POST /collections/notes/points/scroll HTTP/1.1")
+            test.case("and a scroll with one hands the cursor straight back")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":{\"points\":[],"
+                                       + "\"next_page_offset\":7}}")))
+                        == "POST /collections/notes/points/scroll HTTP/1.1")
+            test.case("a search is the vector, the k and the payload")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":["
+                                       + a_point("d1", "denmark") + "]}")))
+                        == "POST /collections/notes/points/search HTTP/1.1")
+            test.case("a 5xx is a fault, and the sentence the server wrote rides in it")
+            test.assert(request_line(
+                serve_once(server, a_reply(500, "{\"boom\":1}")))
+                        == "POST /collections/notes/points/scroll HTTP/1.1")
+            test.case("a delete reads the points first, then deletes their ids")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":["
+                                       + a_point("d1", "denmark") + "]}")))
+                        == "POST /collections/notes/points HTTP/1.1")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":{\"status\":\"completed\"}}")))
+                        == "POST /collections/notes/points/delete HTTP/1.1")
+            test.case("and a qdrant error body with nothing to read is the status alone")
+            test.assert(request_line(serve_once(server, a_reply(500, "{\"a\":1}")))
+                        == "GET /collections/notes HTTP/1.1")
+            test.assert(request_line(
+                serve_once(server, a_reply(500, "{\"status\":{\"x\":1}}")))
+                        == "GET /collections/notes HTTP/1.1")
+
+            test.case("chroma: a health check is a GET of the collection")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"name\":\"notes\"}")))
+                        == "GET /api/v1/collections/notes HTTP/1.1")
+            test.case("a 404 is the same answer there")
+            test.assert(request_line(serve_once(server, a_reply(404, "{}")))
+                        == "GET /api/v1/collections/notes HTTP/1.1")
+            test.case("and a 500 is the dialect's own fault, code and sentence both")
+            test.assert(request_line(
+                serve_once(server, a_reply(500,
+                    "{\"error\":\"Internal\",\"message\":\"the index is rebuilding\"}")))
+                        == "GET /api/v1/collections/notes HTTP/1.1")
+            test.case("creating a collection is a POST of its name and space")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"name\":\"notes\"}")))
+                        == "POST /api/v1/collections HTTP/1.1")
+            test.case("a 409 there is a collection that already exists")
+            test.assert(request_line(serve_once(server, a_reply(409, "{}")))
+                        == "POST /api/v1/collections HTTP/1.1")
+            test.case("and anything else is a fault")
+            test.assert(request_line(serve_once(server, a_reply(500, "{}")))
+                        == "POST /api/v1/collections HTTP/1.1")
+            test.case("a chroma get is one POST with the ids and what to include")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, a_chroma_row("d1", "denmark"))))
+                        == "POST /api/v1/collections/notes/get HTTP/1.1")
+            test.case("a chroma count is a bare number, read as one")
+            test.assert(request_line(serve_once(server, a_reply(200, "3")))
+                        == "GET /api/v1/collections/notes/count HTTP/1.1")
+            test.case("and a count sent as JSON is read as that")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"count\":3}")))
+                        == "GET /api/v1/collections/notes/count HTTP/1.1")
+            test.case("a short chroma page is the end of the collection")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, a_chroma_row("d1", "denmark"))))
+                        == "POST /api/v1/collections/notes/get HTTP/1.1")
+            test.case("and a full one hands back the next offset as the cursor")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, a_chroma_row("d2", "sweden"))))
+                        == "POST /api/v1/collections/notes/get HTTP/1.1")
+
+            test.case("qdrant behind a proxy that mounts it keeps the mount in front of the path")
+            test.assert(request_line(
+                serve_once(server, a_reply(200, "{\"result\":{\"count\":3}}")))
+                        == "POST /qdrant/collections/notes/points/count HTTP/1.1")
+
+            test.case("an ensure answered 5xx is a fault where a 200 or a 409 is a fact")
+            test.assert(request_line(
+                serve_once(server, a_reply(500, "{\"status\":{\"error\":\"boom\"}}")))
+                        == "PUT /collections/notes HTTP/1.1")
+            test.case("a scroll whose body has no `result` member is malformed")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"x\":1}")))
+                        == "POST /collections/notes/points/scroll HTTP/1.1")
+            test.case("and one whose result carries no `points` list is too")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"result\":{}}")))
+                        == "POST /collections/notes/points/scroll HTTP/1.1")
+            test.case("deleting ids the collection does not hold is zero, with no delete sent")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"result\":[]}")))
+                        == "POST /collections/notes/points HTTP/1.1")
+            test.case("a count whose body has no `result` member is malformed")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"x\":1}")))
+                        == "POST /collections/notes/points/count HTTP/1.1")
+            test.case("and a result that carries no `count` inside it is too")
+            test.assert(request_line(serve_once(server, a_reply(200, "{\"result\":{}}")))
+                        == "POST /collections/notes/points/count HTTP/1.1")
+
+            test.case("and the client read every one of those the way the reply says")
+            test.assert_eq(cell.join(h), 8589934591)
+            net.close(server)

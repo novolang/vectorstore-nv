@@ -1,7 +1,5 @@
 // vssearch.nv — the search, and the decision a filter forces on it.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.  A search over a collection value is arithmetic.
 //
 // **THIS MODULE IS THE LOAD-BEARING INTERFACE OF THE PACKAGE, AND
@@ -50,8 +48,17 @@
 // `distance` beside it, so nothing downstream has to know which
 // convention the index used.
 
+use std.json
+use std.list
 use hnswsearch
+use hnswparam
+use hnswdist
 use embsim
+use vsbm25
+use vsrank
+use vsdoc
+use vsfilter
+use vsfault
 
 // How a filter is applied to an approximate search.
 pub enum VsFilterPlan
@@ -91,7 +98,10 @@ pub enum VsFilterPlan
 //     // : a narrow filter is scanned exactly
 // ```
 pub fn plan_for(estimated_matches: Int, corpus_size: Int, k: Int) -> VsFilterPlan []
-    todo("vectorstore-nv.vssearch.plan_for")
+    if estimated_matches <= pre_filter_max()
+        VsPreFilter
+    else
+        VsFilteredTraversal
 
 // The threshold `plan_for` uses, published so it can be asserted.
 //
@@ -103,7 +113,19 @@ pub fn plan_for(estimated_matches: Int, corpus_size: Int, k: Int) -> VsFilterPla
 //     // : true
 // ```
 pub fn pre_filter_max() -> Int []
-    todo("vectorstore-nv.vssearch.pre_filter_max")
+    // A thousand exact comparisons is cheaper than one graph walk's
+    // pointer chasing, and the number is here rather than inlined so a
+    // caller can assert the rule instead of describing it.
+    1000
+
+// How many documents `VsAuto` samples to estimate a filter's
+// selectivity.
+//
+// Not a parameter of `search`, because it is a property of the rule
+// rather than of a query: `estimate_matches` takes the sample so a
+// caller measuring on their own corpus can pass the corpus size and
+// pay for the exact count.
+const PLAN_SAMPLE = 256
 
 // One query.
 pub struct VsQuery
@@ -133,7 +155,8 @@ pub struct VsQuery
 //     // : 10
 // ```
 pub fn query(vector: [Float], k: Int) -> VsQuery []
-    todo("vectorstore-nv.vssearch.query")
+    VsQuery { vector: vector, text: "", k: k, filter: VsAll, plan: VsAuto, ef: 0 - 1,
+              model: "" }
 
 // A keyword query.
 //
@@ -145,7 +168,8 @@ pub fn query(vector: [Float], k: Int) -> VsQuery []
 //     // : capital of Denmark
 // ```
 pub fn text_query(text: Str, k: Int) -> VsQuery []
-    todo("vectorstore-nv.vssearch.text_query")
+    VsQuery { vector: [], text: text, k: k, filter: VsAll, plan: VsAuto, ef: 0 - 1,
+              model: "" }
 
 // A hybrid query: both halves, fused by rank.
 //
@@ -158,7 +182,8 @@ pub fn text_query(text: Str, k: Int) -> VsQuery []
 //     // : 10
 // ```
 pub fn hybrid_query(vector: [Float], text: Str, k: Int) -> VsQuery []
-    todo("vectorstore-nv.vssearch.hybrid_query")
+    VsQuery { vector: vector, text: text, k: k, filter: VsAll, plan: VsAuto, ef: 0 - 1,
+              model: "" }
 
 // The same query with a metadata filter.
 //
@@ -170,7 +195,8 @@ pub fn hybrid_query(vector: [Float], text: Str, k: Int) -> VsQuery []
 //     vssearch.with_filter(q, f)
 // ```
 pub fn with_filter(q: VsQuery, f: VsFilter) -> VsQuery []
-    todo("vectorstore-nv.vssearch.with_filter")
+    VsQuery { vector: q.vector, text: q.text, k: q.k, filter: f, plan: q.plan, ef: q.ef,
+              model: q.model }
 
 // The same query with a named filter plan.
 //
@@ -181,7 +207,8 @@ pub fn with_filter(q: VsQuery, f: VsFilter) -> VsQuery []
 //     vssearch.with_plan(q, VsPreFilter)
 // ```
 pub fn with_plan(q: VsQuery, p: VsFilterPlan) -> VsQuery []
-    todo("vectorstore-nv.vssearch.with_plan")
+    VsQuery { vector: q.vector, text: q.text, k: q.k, filter: q.filter, plan: p, ef: q.ef,
+              model: q.model }
 
 // The same query with an explicit candidate width.
 //
@@ -192,7 +219,8 @@ pub fn with_plan(q: VsQuery, p: VsFilterPlan) -> VsQuery []
 //     vssearch.with_ef(q, 200)
 // ```
 pub fn with_ef(q: VsQuery, ef: Int) -> VsQuery []
-    todo("vectorstore-nv.vssearch.with_ef")
+    VsQuery { vector: q.vector, text: q.text, k: q.k, filter: q.filter, plan: q.plan, ef: ef,
+              model: q.model }
 
 // The same query asserting which model the vector came from.
 //
@@ -203,7 +231,8 @@ pub fn with_ef(q: VsQuery, ef: Int) -> VsQuery []
 //     vssearch.with_model(q, "text-embedding-3-small")
 // ```
 pub fn with_model(q: VsQuery, model: Str) -> VsQuery []
-    todo("vectorstore-nv.vssearch.with_model")
+    VsQuery { vector: q.vector, text: q.text, k: q.k, filter: q.filter, plan: q.plan, ef: q.ef,
+              model: model }
 
 // One result.
 pub struct VsHit
@@ -272,7 +301,226 @@ pub struct VsSearchOutcome
 //         Err(_) => false
 // ```
 pub fn search(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
-    todo("vectorstore-nv.vssearch.search")
+    check(c, q)!
+    if list.len(q.vector) > 0 and q.text != ""
+        hybrid_outcome(c, q)
+    elif q.text != ""
+        keyword_outcome(c, q)
+    else
+        vector_outcome(c, q)
+
+// Which plan runs, with `VsAuto` resolved.
+//
+// The estimate is over `PLAN_SAMPLE` live documents rather than the
+// corpus, so this is the one place a plan is chosen from a number
+// that is not the truth.  The direction of the error is deliberate:
+// the estimate is floored, so an uncertain filter estimates low,
+// lands under the threshold and gets the EXACT plan.
+fn resolve_plan(c: VsCollection, q: VsQuery) -> VsFilterPlan
+    if is_auto(q.plan)
+        plan_for(estimate_matches(c, q.filter, PLAN_SAMPLE), vsdoc.doc_count(c), q.k)
+    else
+        q.plan
+
+fn is_auto(p: VsFilterPlan) -> Bool
+    match p
+        VsAuto => true
+        _      => false
+
+// The vector half, by whichever plan ran.
+fn vector_outcome(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    match resolve_plan(c, q)
+        VsPostFilter(over)  => post_filtered(c, q, q.filter, over)
+        VsFilteredTraversal => traversed(c, q, q.filter)
+        _                   => pre_filtered(c, q, q.filter)
+
+// PRE-FILTER: every live document's metadata is asked, and the
+// survivors are compared exactly.  The only plan that can promise it
+// saw every match.
+fn pre_filtered(c: VsCollection, q: VsQuery, f: VsFilter) -> Result<VsSearchOutcome, VsFault> []
+    var labels: [Int] = []
+    var dists: [Float] = []
+    var examined = 0
+    var rejected = 0
+    var at = 0
+    for d in c.docs
+        if not list.contains(c.deleted, d.id)
+            examined = examined + 1
+            if vsfilter.matches(f, d.metadata)!
+                labels = list.push(labels, at)
+                dists = list.push(dists, distance_of(c.config.metric, q.vector, d.vector)!)
+            else
+                rejected = rejected + 1
+        at = at + 1
+    Ok(VsSearchOutcome { hits: rank_by_distance(c, labels, dists, q.k), exhaustive: true,
+                         plan: VsPreFilter, examined: examined, filtered_out: rejected })
+
+// POST-FILTER: k from the index, then the filter over what came back.
+//
+// `exhaustive` is false unconditionally, even when the over-fetch was
+// larger than the corpus: the vector half is an approximate walk that
+// never promised it found the documents the filter would have kept,
+// so a post-filter cannot know what it missed.
+fn post_filtered(c: VsCollection, q: VsQuery, f: VsFilter,
+                 over: Int) -> Result<VsSearchOutcome, VsFault> []
+    let ef = ef_for(c, q)
+    let fetch = if over > q.k
+        over
+    else
+        q.k
+    let raw = match hnswsearch.search(c.index, q.vector, fetch, ef)
+        Err(hf) => Err(VsIndexFailed(hnswfault_text(hf)))
+        Ok(hs)  => Ok(hs)
+    // THE PAYLOAD IS DESTRUCTURED, NOT BOUND.  `let rows = raw!` here
+    // answers an EMPTY LIST with no diagnostic anywhere, because this
+    // function is in a module other than the compilation's entry file
+    // and the `Err` arm is written first: both make the difference
+    // between a silent zero-hit answer and the right one.  Same text in
+    // the entry file, an inline `raw!`, or the arms swapped all answer
+    // correctly, and `--interp` answers correctly — filed as
+    // `memory-perceus/a-let-bound-bang-of-a-re-wrapped-result-answers-an-empty-list`.
+    // Do not fold this back into a `let`.
+    match raw
+        Err(why) => Err(why)
+        Ok(rows) =>
+            var hits: [VsHit] = []
+            var rejected = 0
+            var rank = 1
+            for h in rows
+                if not live_at(c, h.label)
+                    ()
+                elif vsfilter.matches(f, meta_at(c, h.label))!
+                    hits = list.push(hits, VsHit { id: id_at(c, h.label),
+                                                   score: embsim.as_distance(h.distance),
+                                                   distance: h.distance,
+                                                   source: VsFromVector(rank) })
+                    rank = rank + 1
+                else
+                    rejected = rejected + 1
+            Ok(VsSearchOutcome { hits: list.take(hits, q.k), exhaustive: false,
+                                 plan: VsPostFilter(over), examined: list.len(rows),
+                                 filtered_out: rejected })
+
+// FILTERED TRAVERSAL: the graph is walked and the filter decides, per
+// node, whether the walk may answer it.
+//
+// The verdicts are computed once, up front, because hnsw-nv's `keep`
+// is `fn(Int) -> Bool` — a predicate that cannot say "this filter is
+// broken".  `check` has already refused a filter that cannot be
+// evaluated, so every verdict here is a decision rather than a fault
+// looking for somewhere to go.
+fn traversed(c: VsCollection, q: VsQuery, f: VsFilter) -> Result<VsSearchOutcome, VsFault> []
+    let ef = ef_for(c, q)
+    var kept: [Bool] = []
+    var examined = 0
+    var rejected = 0
+    for d in c.docs
+        if list.contains(c.deleted, d.id)
+            kept = list.push(kept, false)
+        else
+            examined = examined + 1
+            if vsfilter.matches(f, d.metadata)!
+                kept = list.push(kept, true)
+            else
+                kept = list.push(kept, false)
+                rejected = rejected + 1
+    let flags = kept
+    let raw = match hnswsearch.search_filtered(c.index, q.vector, q.k, ef,
+                                              i => kept_at(flags, i))
+        Err(hf) => Err(VsIndexFailed(hnswfault_text(hf)))
+        Ok(hs)  => Ok(hs)
+    // THE PAYLOAD IS DESTRUCTURED, NOT BOUND — see `post_filtered`
+    // above for the measurement and the filing
+    // (`memory-perceus/a-let-bound-bang-of-a-re-wrapped-result-answers-an-empty-list`).
+    match raw
+        Err(why) => Err(why)
+        Ok(rows) =>
+            var hits: [VsHit] = []
+            var rank = 1
+            for h in rows
+                hits = list.push(hits, VsHit { id: id_at(c, h.label),
+                                               score: embsim.as_distance(h.distance),
+                                               distance: h.distance,
+                                               source: VsFromVector(rank) })
+                rank = rank + 1
+            Ok(VsSearchOutcome { hits: hits, exhaustive: false, plan: VsFilteredTraversal,
+                                 examined: examined, filtered_out: rejected })
+
+// The keyword half.
+//
+// Exact by construction — BM25 scores every document in the index —
+// so this arm is always exhaustive and always reports `VsPreFilter`,
+// because that is what ran: the filter was evaluated over the whole
+// live corpus, one document at a time.
+//
+// The score is BM25 itself, which satisfies `VsHit.score`'s rule
+// (higher is nearer) without being a similarity on the same scale as
+// a cosine.  That gap is why `vsrank` fuses RANKS.
+fn keyword_outcome(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    if not c.config.keyword_index
+        return Err(VsUnsupportedQuery("a text search: this collection has no keyword index"))
+    let t = vsbm25.tokenizer()
+    let p = vsbm25.default_params()
+    let scores = vsbm25.score_all(c.keywords, t, p, q.text)
+    var picked: [Int] = []
+    var vals: [Float] = []
+    var examined = 0
+    var rejected = 0
+    var at = 0
+    for s in scores
+        if at < list.len(c.docs)
+            let id = id_at(c, at)
+            if not list.contains(c.deleted, id)
+                examined = examined + 1
+                if vsfilter.matches(q.filter, meta_at(c, at))!
+                    if s > 0.0
+                        picked = list.push(picked, at)
+                        vals = list.push(vals, s)
+                else
+                    rejected = rejected + 1
+        at = at + 1
+    var keyed: [(Float, Int)] = []
+    var i = 0
+    for s in vals
+        keyed = list.push(keyed, (0.0 - s, picked[i]))
+        i = i + 1
+    keyed = list.sort(keyed)
+    var hits: [VsHit] = []
+    var rank = 1
+    for row in list.take(keyed, q.k)
+        hits = list.push(hits, VsHit { id: id_at(c, row.1), score: 0.0 - row.0, distance: 0.0,
+                                       source: VsFromKeyword(rank) })
+        rank = rank + 1
+    Ok(VsSearchOutcome { hits: hits, exhaustive: true, plan: VsPreFilter, examined: examined,
+                         filtered_out: rejected })
+
+// Both halves, merged by reciprocal rank fusion.
+//
+// Each half runs the same filter, so a document cannot sneak into the
+// fused answer on one arm having passed a filter the other refused.
+// The two arms' costs are added rather than maxed: a hybrid search
+// really did do both.
+fn hybrid_outcome(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    if not c.config.keyword_index
+        return Err(VsUnsupportedQuery("a hybrid search: this collection has no keyword index"))
+    let vq = VsQuery { vector: q.vector, text: "", k: q.k, filter: q.filter, plan: q.plan,
+                       ef: q.ef, model: "" }
+    let tq = VsQuery { vector: [], text: q.text, k: q.k, filter: q.filter, plan: q.plan,
+                       ef: q.ef, model: "" }
+    let vout = search(c, vq)!
+    let kout = search(c, tq)!
+    let merged = vsrank.fuse(vsrank.default_fusion(),
+                             [vsrank.of_hits(vout.hits), vsrank.of_hits(kout.hits)])
+    var hits: [VsHit] = []
+    for m in list.take(merged, q.k)
+        hits = list.push(hits, VsHit { id: m.id, score: m.score,
+                                       distance: distance_of_id(vout.hits, m.id),
+                                       source: source_of(rank_in(m.ranks, 0), rank_in(m.ranks, 1)) })
+    Ok(VsSearchOutcome { hits: hits,
+                         exhaustive: vout.exhaustive and kout.exhaustive,
+                         plan: vout.plan,
+                         examined: vout.examined + kout.examined,
+                         filtered_out: vout.filtered_out + kout.filtered_out })
 
 // Search, and answer the documents rather than the hits.
 //
@@ -289,7 +537,10 @@ pub fn search(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [
 //         Err(_) => false
 // ```
 pub fn search_docs(c: VsCollection, q: VsQuery) -> Result<VsDocResults, VsFault> []
-    todo("vectorstore-nv.vssearch.search_docs")
+    let o = search(c, q)!
+    var ids: [Str] = []
+    list.append(ids, list.map(o.hits, h => h.id))
+    Ok(VsDocResults { docs: vsdoc.get_many(c, ids), outcome: o })
 
 // Documents and the outcome that produced them.
 pub struct VsDocResults
@@ -314,7 +565,14 @@ pub struct VsDocResults
 //         Err(_) => false
 // ```
 pub fn exact_search(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
-    todo("vectorstore-nv.vssearch.exact_search")
+    check(c, q)!
+    if list.len(q.vector) == 0
+        keyword_outcome(c, q)
+    else
+        // The pre-filter IS the oracle: the filter over every live
+        // document, then an exact comparison against each survivor.
+        // No graph, no `ef`, no approximation anywhere.
+        pre_filtered(c, q, q.filter)
 
 // What fraction of the exact answer an approximate one found.
 //
@@ -330,7 +588,17 @@ pub fn exact_search(c: VsCollection, q: VsQuery) -> Result<VsSearchOutcome, VsFa
 //     vssearch.recall(approx, exact)
 // ```
 pub fn recall(approx: VsSearchOutcome, exact: VsSearchOutcome) -> Float []
-    todo("vectorstore-nv.vssearch.recall")
+    if list.len(exact.hits) == 0
+        // Nothing to have found.  Zero rather than one: an empty
+        // oracle is not a perfect answer, it is a question that was
+        // never asked.
+        return 0.0
+    var ids: [Str] = []
+    list.append(ids, list.map(approx.hits, h => h.id))
+    let found = list.count(exact.hits, h => list.contains(ids, h.id))
+    let got = found as Float
+    let want = list.len(exact.hits) as Float
+    got / want
 
 // Whether a query can be answered by this collection at all.
 //
@@ -349,7 +617,22 @@ pub fn recall(approx: VsSearchOutcome, exact: VsSearchOutcome) -> Float []
 //         Err(_) => false
 // ```
 pub fn check(c: VsCollection, q: VsQuery) -> Result<Int, VsFault> []
-    todo("vectorstore-nv.vssearch.check")
+    if q.k <= 0
+        return Err(VsUnsupportedQuery("a search for ${q.k} documents"))
+    if q.model != "" and q.model != c.config.model
+        return Err(VsModelMismatch(c.config.model, q.model))
+    vsfilter.check(q.filter)!
+    let has_vector = list.len(q.vector) > 0
+    let has_text = q.text != ""
+    if not has_vector and not has_text
+        return Err(VsUnsupportedQuery("a query with neither a vector nor text"))
+    if has_vector and c.config.dim <= 0
+        return Err(VsUnsupportedQuery("a vector search: this collection holds no vectors"))
+    if has_vector and list.len(q.vector) != c.config.dim
+        return Err(VsDimMismatch(c.config.dim, list.len(q.vector)))
+    if has_text and not c.config.keyword_index
+        return Err(VsUnsupportedQuery("a text search: this collection has no keyword index"))
+    Ok(q.k)
 
 // One line saying what a search did, for a log or an explanation.
 //
@@ -365,7 +648,20 @@ pub fn check(c: VsCollection, q: VsQuery) -> Result<Int, VsFault> []
 //     vssearch.explain(o)
 // ```
 pub fn explain(o: VsSearchOutcome) -> Str []
-    todo("vectorstore-nv.vssearch.explain")
+    let plan = plan_name(o.plan)
+    let n = list.len(o.hits)
+    let how = if o.exhaustive
+        "every matching document was considered"
+    else
+        "it may have missed documents"
+    "${plan}: ${n} hit(s) over ${o.examined} examined, ${o.filtered_out} filtered out — ${how}"
+
+fn plan_name(p: VsFilterPlan) -> Str
+    match p
+        VsAuto              => "auto"
+        VsPostFilter(_)     => "post-filter"
+        VsPreFilter         => "pre-filter"
+        VsFilteredTraversal => "filtered traversal"
 
 // How many documents a filter is estimated to match.
 //
@@ -382,4 +678,109 @@ pub fn explain(o: VsSearchOutcome) -> Str []
 //     vssearch.estimate_matches(c, f, 1000)
 // ```
 pub fn estimate_matches(c: VsCollection, f: VsFilter, sample: Int) -> Int []
-    todo("vectorstore-nv.vssearch.estimate_matches")
+    let live = vsdoc.doc_count(c)
+    if live == 0
+        return 0
+    let want = if sample >= live
+        live
+    else
+        sample
+    if want <= 0
+        return 0
+    // The first `want` live documents in label order — the sample is
+    // deterministic rather than random, so two runs over one corpus
+    // choose the same plan and a benchmark means something.
+    var seen = 0
+    var matched = 0
+    for d in c.docs
+        if seen < want and not list.contains(c.deleted, d.id)
+            seen = seen + 1
+            match vsfilter.matches(f, d.metadata)
+                Ok(true) =>
+                    matched = matched + 1
+                _        => ()
+    if seen == 0
+        return 0
+    // Scaled up with integer division, which floors: an uncertain
+    // filter estimates low, and a low estimate lands under
+    // `pre_filter_max` and gets the plan that cannot miss.
+    matched * live / seen
+
+// The hits of an exact comparison, nearest first.
+fn rank_by_distance(c: VsCollection, labels: [Int], dists: [Float], k: Int) -> [VsHit]
+    var keyed: [(Float, Int)] = []
+    var i = 0
+    for d in dists
+        keyed = list.push(keyed, (d, labels[i]))
+        i = i + 1
+    keyed = list.sort(keyed)
+    var out: [VsHit] = []
+    var rank = 1
+    for row in list.take(keyed, k)
+        out = list.push(out, VsHit { id: id_at(c, row.1), score: embsim.as_distance(row.0),
+                                     distance: row.0, source: VsFromVector(rank) })
+        rank = rank + 1
+    out
+
+// The candidate width: the query's if it named one, otherwise
+// hnsw-nv's own default for this index and k.
+fn ef_for(c: VsCollection, q: VsQuery) -> Int
+    if q.ef >= 1
+        q.ef
+    else
+        hnswparam.default_ef(c.config.params, q.k)
+
+// **THE ID TABLE.**  hnsw-nv indexes by an integer the caller chose
+// and hands that integer back; a store that answers a caller's own id
+// has to map it, and the map is the thing that silently corrupts.
+// Every hit built above reads its id through here.
+fn id_at(c: VsCollection, label: Int) -> Str
+    if label < 0 or label >= list.len(c.docs)
+        return ""
+    let d = c.docs[label]
+    d.id
+
+fn live_at(c: VsCollection, label: Int) -> Bool
+    if label < 0 or label >= list.len(c.docs)
+        return false
+    let d = c.docs[label]
+    not list.contains(c.deleted, d.id)
+
+fn meta_at(c: VsCollection, label: Int) -> JsonValueH
+    if label < 0 or label >= list.len(c.docs)
+        return json.object([])
+    let d = c.docs[label]
+    d.metadata
+
+fn kept_at(kept: [Bool], i: Int) -> Bool
+    if i < 0 or i >= list.len(kept)
+        return false
+    kept[i]
+
+fn rank_in(ranks: [Int], li: Int) -> Int
+    if li < 0 or li >= list.len(ranks)
+        return 0 - 1
+    ranks[li]
+
+fn source_of(vr: Int, kr: Int) -> VsSource
+    match (vr >= 0, kr >= 0)
+        (true, true)  => VsFromBoth(vr, kr)
+        (true, false) => VsFromVector(vr)
+        _             => VsFromKeyword(kr)
+
+// The distance the vector half computed for a fused hit, or 0.0 for a
+// document only the keyword half found — no index compared it, and a
+// number here would be invented.
+fn distance_of_id(hits: [VsHit], id: Str) -> Float
+    for h in hits
+        if h.id == id
+            return h.distance
+    0.0
+
+fn distance_of(metric: HnswMetric, v: [Float], w: [Float]) -> Result<Float, VsFault> []
+    match hnswdist.distance(metric, v, w)
+        Ok(d)  => Ok(d)
+        Err(f) => Err(VsIndexFailed(hnswfault_text(f)))
+
+fn hnswfault_text(f: HnswFault) -> Str []
+    f.message()

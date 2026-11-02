@@ -13,12 +13,6 @@ is built on hnsw-nv,
 [embeddings-nv](https://novo-lang.org/packages/embeddings-nv) and
 [unicode-nv](https://novo-lang.org/packages/unicode-nv).
 
-**Status: NOT IMPLEMENTED — interface only.** Every function is declared
-with its full signature, but every body is a `todo()` that panics when
-called. The package is published so its design can be reviewed and
-depended on before it is implemented. Version 0.1.0 will be the first
-working release.
-
 ## What it is
 
 A **document** is an identifier, some text, some metadata as a JSON value,
@@ -110,15 +104,12 @@ fn main() [io]
                 Ok(r)  =>
                     // A search that was not exhaustive may have missed
                     // matches, and its result looks like a complete one.
-                    if r.outcome.exhaustive == false
+                    if not r.outcome.exhaustive
                         println(vssearch.explain(r.outcome))
                     println("${list.len(r.docs)} document(s)")
 ```
 
-Build and test with `novo pkg build` and `novo test`. Today `novo test`
-fails on purpose: every test reaches a
-`not implemented: vectorstore-nv.<module>.<fn>` panic. The tests are the
-specification the implementation will have to satisfy.
+Build and test with `novo pkg build` and `novo test`.
 
 ## What the package contains
 
@@ -209,10 +200,14 @@ trait implementation on `VsHttp` is the same exchange over a socket.
    produce the same ranks. `VsFusion.weights` is the escape for a caller
    who has measured their own corpus, and `VsSource.VsFromBoth` is what an
    explanation shows instead.
-10. **A filter is a value, not a JSON document.** Everything in the
-    language translates to both server dialects, so a filter the compiler
-    accepted cannot be refused at run time by one of them. A substring
-    match and a regular expression are absent for that reason.
+10. **A filter is a value, not a JSON document.** The language is closed
+    over what both server dialects can carry, with three exceptions that
+    are refused rather than approximated: chroma has no `where` operator
+    for a prefix match, an existence test or an absence test, so
+    `VsPrefix`, `VsExists` and `VsMissing` are `VsUnsupportedQuery`
+    against it — refused by name, at run time, for a filter the compiler
+    accepted. A substring match and a regular expression are absent from
+    the language altogether for the same reason.
 11. **Negation applies to one clause, not to a subtree.** `not (year >
     2020)` is true for a document with no `year` at all, which is almost
     never what was meant. `VsMissing` is the explicit way to ask for an
@@ -227,8 +222,17 @@ trait implementation on `VsHttp` is the same exchange over a socket.
     questions, and a store that answered `VsAll` for the second returns the
     whole corpus.
 14. **`vsfilter.matches` is what a filter means.** Each server translation
-    is tested against it, with the same filter and the same document
-    through all three.
+    is tested against it — the same filter and the same document through
+    the local evaluator and through both dialects, judged by a reading of
+    each server's own documented semantics rather than by a transcript of
+    what this package emits. Three places the servers answer differently
+    are named rather than hidden: a comparison against a field a document
+    does not have (this package answers false, and a qdrant `must_not` is
+    `NOT A`, so a `VsNe` there is true for a document with no such field),
+    a comparison between two types (this package answers `VsBadFilter`;
+    both servers answer false, which no caller can tell from no match),
+    and an empty `in` (refused here, false there). qdrant's `is_empty`
+    also counts `[]` as absent, which `VsMissing` does not.
 15. **A hybrid search on a collection with no keyword index is refused.**
     `VsUnsupportedQuery` names what was missing, which is better than a
     hybrid search that quietly becomes a vector search.
@@ -301,57 +305,31 @@ trait implementation on `VsHttp` is the same exchange over a socket.
 ## Tests
 
 ```bash
-novo test tests/vsvalue_tests.nv     # 31 tests: documents, filters, fusion, faults
-novo test tests/vssearch_tests.nv    # 14 tests: the four plans and what a result says
-novo test tests/vsstore_tests.nv     #  8 tests: the trait and the in-memory store
-novo test tests/vsio_tests.nv        #  7 tests: the file format and the two dialects
+novo test tests/vsvalue_tests.nv          # 31 tests: documents, filters, fusion, faults
+novo test tests/vssearch_tests.nv         # 14 tests: the four plans and what a result says
+novo test tests/vsstore_tests.nv          #  8 tests: the trait and the in-memory store
+novo test tests/vsio_tests.nv             #  7 tests: the file format and the two dialects
+novo test tests/vectorstore_edge_tests.nv #  9 tests: the four ways it answers wrong, quietly
 ```
 
 The BM25 numbers are Robertson and Walker's `k1` of 1.2 and `b` of 0.75,
 and the BM25+ lower bound is Lv and Zhai's. The fusion constant of 60 is
 Cormack, Clarke and Buettcher's. The filter semantics are
-`vsfilter.matches`, and the two server translations are asserted against it
-rather than against a transcript.
+`vsfilter.matches`, and the two server translations are asserted against a
+reading of each server's own documented semantics rather than against a
+transcript.
 
 The suite asserts what each plan does to `exhaustive`, that a post-filter
 is never chosen automatically, and that a score coming out of either server
 is a similarity.
 
-The tests compile today and fail at run, each on the
-`not implemented: vectorstore-nv.<module>.<fn>` panic that is its body.
-That is the expected state of an interface release. They turn green one at
-a time as bodies land.
-
-## Implementation status
-
-| Item | Implemented |
-| --- | --- |
-| `vsdoc.doc`, `.with_metadata`, `.with_vector`, `.config`, `.with_keyword_index`, `.collection` | no |
-| `vsdoc.upsert`, `.upsert_many`, `.delete`, `.compact` | no |
-| `vsdoc.get`, `.get_many`, `.doc_count`, `.deleted_count`, `.ids`, `.check_vector` | no |
-| `vsfilter.is_clause`, `.all_of`, `.any_of`, `.check`, `.matches` | no |
-| `vsfilter.clause_count`, `.fields_of`, `.simplify`, `.is_satisfiable` | no |
-| `vsfilter.value_of`, `.value_json` | no |
-| `vsbm25.default_params`, `.params`, `.tokenizer`, `.with_stop_words`, `.tokenize` | no |
-| `vsbm25.build`, `.empty_index`, `.add`, `.score_all`, `.top_k` | no |
-| `vsbm25.idf`, `.doc_frequency`, `.average_length`, `.unknown_terms`, `.term_count` | no |
-| `vsrank.default_fusion`, `.fusion`, `.ranking`, `.of_hits`, `.check` | no |
-| `vsrank.fuse`, `.contribution`, `.found_in`, `.take_k`, `.overlap` | no |
-| `vssearch.plan_for`, `.pre_filter_max`, `.estimate_matches` | no |
-| `vssearch.query`, `.text_query`, `.hybrid_query`, `.with_filter`, `.with_plan`, `.with_ef`, `.with_model` | no |
-| `vssearch.search`, `.search_docs`, `.exact_search`, `.recall`, `.check`, `.explain` | no |
-| `vsstore.memory`, `.with_tokenizer`, `.with_bm25`, `.with_fusion`, `.snapshot` | no |
-| `VsStore` for `VsMemory`, for `VsFileStore` and for `VsHttp`: all five methods | no |
-| `vsstore.retrieve`, `.ingest`, `.check_query` | no |
-| `vsfile.VS_FILE_MAGIC`, `.VS_FILE_VERSION` | yes (they are constants) |
-| `vsfile.supported_versions`, `.to_bytes`, `.from_bytes`, `.peek_header`, `.size_bound`, `.is_collection` | no |
-| `vsfile.save`, `.load`, `.read_header`, `.is_collection_file`, `.open`, `.flush` | no |
-| `vshttp.dialect_name`, `.dialect_of_name`, `.qdrant`, `.chroma`, `.with_header`, `.with_model` | no |
-| `vshttp.encode_filter`, `.encode_search`, `.encode_upsert` | no |
-| `vshttp.decode_search`, `.decode_get`, `.decode_error` | no |
-| `vshttp.search_path`, `.upsert_path`, `.point_id`, `.check_query` | no |
-| `vshttp.scroll`, `.health`, `.ensure_collection` | no |
-| `vsfault.is_retryable`, `.is_caller_error`, `VsFault.message` | no |
+The edge suite is the four ways a store like this corrupts an answer while
+every verdict stays green, and each one is a measurement rather than a
+promise: the id mapping across a delete and a re-add, recall measured
+against a brute-force scan of the same vectors and printed, a case where
+cosine, dot and Euclidean rank one corpus three different ways, and every
+query shape asked for a document that was deleted. It builds 1200 vectors
+of 16 dimensions per case, so it is the slowest of the five.
 
 ## Licence
 

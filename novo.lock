@@ -3,27 +3,27 @@
 [embeddings-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.1.0"
-version = "0.1.0"
-hash = "f2e3eb70f329de23e123621d10c92a8cc71aa093a68a7ac3a5b9fb556d052275"
+req = "^0.1.1"
+version = "0.1.1"
+hash = "f17cbd2b956c0b0538ceb7ae78dfa8b0ac69adf217800a7b3d6f63a12eca3bd4"
 
 [hnsw-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.1.0"
-version = "0.1.0"
-hash = "3d9cb2413a67bb05e8c09e84d221870f29a45b2d5778646d2dffc890397da063"
+req = "^0.1.1"
+version = "0.1.1"
+hash = "197b4be85e2da85fca0557f05a93a4b719d246401d539da41608152c2ee91ed0"
 
 [ndarray-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
 req = "^0.1.4"
-version = "0.1.4"
-hash = "e7a67642411a0e62f88f53f54b4749e3c83b34a892ba568f40c49f5b538e1cff"
+version = "0.1.5"
+hash = "c88c23fdf1ceade0cfc16b56679ded6743bb5277612116871a6ec11923578f5b"
 
 [unicode-nv]
 source = "registry"
 url = "https://registry.novo-lang.org"
-req = "^0.1.3"
-version = "0.1.3"
-hash = "bb136fc5a87b6306b006781512a2b65ec4b0d8b86d4016ba7d94ee089ea2c120"
+req = "^0.1.4"
+version = "0.1.4"
+hash = "bc839c4dec2e823dd8162f00bfa56cdcc1a894c839129eef2b069d3cf73d5ea7"

@@ -1,9 +1,5 @@
 // vsstore_tests.nv — the whole retrieval pipeline at `[]`.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// vectorstore-nv.<module>.<fn>`.
-//
 // THE COMPILER MAKES THE FIRST ASSERTION BEFORE THE RUN STARTS.
 // `VsMemory` implements `VsStore[]`, and the functions that drive a
 // store over it carry no effect row at all.  If `vsstore.retrieve`
@@ -18,6 +14,7 @@ use std.list
 use hnswparam
 use vsbm25
 use vsdoc
+use vsfilter
 use vsrank
 use vssearch
 use vsstore
@@ -59,8 +56,22 @@ fn test_the_generic_call_is_what_an_application_writes() [io]
     match vsstore.retrieve(s, vssearch.query([1.0, 1.0], 10))
         Err(_) => test.assert(false)
         Ok(r)  =>
-            test.assert(list.len(r.docs) >= 0)
+            test.assert(list.len(r.docs) == 0)
             test.assert(r.outcome.exhaustive)
+
+    test.case("and the ids it searches for are the hits' own")
+    match s.vs_upsert([a_doc("a", "denmark", 1.0), a_doc("b", "sweden", 0.5)])
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(true)
+
+    match vsstore.retrieve(s, vssearch.query([1.0, 1.0], 10))
+        Err(_) => test.assert(false)
+        Ok(r)  =>
+            test.case("the documents came back, in the order the search ranked them")
+            test.assert(list.len(r.docs) == 2)
+            match list.first(r.docs)
+                None    => test.assert(false)
+                Some(d) => test.assert(d.id == "a")
 
 @test
 fn test_ingestion_is_batched_because_a_remote_store_charges_a_round_trip() [io]
@@ -69,6 +80,22 @@ fn test_ingestion_is_batched_because_a_remote_store_charges_a_round_trip() [io]
     match vsstore.ingest(s, [a_doc("a", "denmark", 1.0), a_doc("b", "sweden", 0.5)], 128)
         Err(_) => test.assert(false)
         Ok(n)  => test.assert(n == 2)
+
+@test
+fn test_a_batch_below_one_sends_everything_in_one_call() [io]
+    let s = a_store()
+
+    match vsstore.ingest(s, [a_doc("a", "denmark", 1.0), a_doc("b", "sweden", 0.5)], 0)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 2)
+
+@test
+fn test_a_batch_smaller_than_the_documents_sends_them_in_several_calls() [io]
+    let s = a_store()
+
+    match vsstore.ingest(s, [a_doc("a", "denmark", 1.0), a_doc("b", "sweden", 0.5), a_doc("c", "norway", 0.2)], 2)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 3)
 
 @test
 fn test_a_query_a_store_cannot_answer_is_refused_in_the_same_words_everywhere() [io]
@@ -133,6 +160,113 @@ fn test_a_hybrid_search_says_which_half_found_each_document() [io]
             match list.first(o.hits)
                 None    => test.assert(false)
                 Some(h) =>
+                    test.case("the one document was found by both halves")
                     match h.source
                         VsFromBoth(_, _) => test.assert(true)
-                        _                => test.assert(true)
+                        _                => test.assert(false)
+
+@test
+fn test_a_store_answers_a_text_query_from_its_own_index() [io]
+    // The store is where the caller's own tokeniser and BM25 parameters
+    // live, so the keyword half runs over the store's index and not
+    // `vsdoc`'s default one.
+    let s = a_store()
+    let da = vsdoc.with_metadata(vsdoc.doc("a", "denmark", [1.0, 1.0]),
+                                 json.object([("lang", json.string("da"))]))
+    let sv = vsdoc.with_metadata(vsdoc.doc("b", "sweden", [0.5, 1.0]),
+                                 json.object([("lang", json.string("sv"))]))
+
+    match s.vs_upsert([da, sv])
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(true)
+
+    test.case("the query is answered, the other document filtered out")
+    let q = vssearch.with_filter(vssearch.text_query("denmark", 10),
+                                 vsfilter.is_clause(VsEq("lang", VsStr("da"))))
+
+    match s.vs_search(q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.assert(list.len(o.hits) == 1)
+            test.assert(o.exhaustive)
+            test.assert(o.filtered_out == 1)
+
+@test
+fn test_a_delete_of_an_absent_id_counts_nothing_and_is_not_a_fault() [io]
+    // A delete of ten ids where three were already gone is a delete of
+    // seven, not a refused call.
+    let s = a_store()
+
+    match s.vs_delete(["never-there"])
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 0)
+
+@test
+fn test_a_store_without_a_keyword_index_still_takes_documents() [io]
+    // The rebuild is skipped, not attempted over an index that is not
+    // there.
+    let s = vsstore.memory(vsdoc.collection("notes",
+                vsdoc.config(2, HnswCosine, "test-model",
+                             hnswparam.default_params(2, HnswCosine)!)))
+
+    match s.vs_upsert([a_doc("a", "denmark", 1.0)])
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 1)
+
+    test.case("and answers a vector query over what it holds")
+    match vsstore.check_query(s, vssearch.query([1.0, 1.0], 10))
+        Err(_)   => test.assert(false)
+        Ok(hits) => test.assert(hits == 1)
+
+@test
+fn test_an_ingest_of_nothing_is_no_round_trip_at_all() [io]
+    let s = a_store()
+
+    match vsstore.ingest(s, [], 128)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n == 0)
+
+@test
+fn test_a_hybrid_store_search_names_the_half_that_found_each_document() [io]
+    // The same rule as `vssearch`, over the store's own parameters:
+    // a document only the keyword half found has no index distance to
+    // report, so it carries zero rather than an invented number.
+    let s = a_store()
+    let rows = [a_doc("denmark", "denmark", 1.0),
+                a_doc("sweden", "sweden", 0.9),
+                a_doc("norway", "norway", 0.8),
+                vsdoc.doc("denmark twice", "denmark denmark", [-1.0, -1.0])]
+
+    match s.vs_upsert(rows)
+        Err(_) => test.assert(false)
+        Ok(_)  => test.assert(true)
+
+    match s.vs_search(vssearch.hybrid_query([1.0, 1.0], "denmark", 3))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            var both = 0
+            var keywords = 0
+            for h in o.hits
+                match h.source
+                    VsFromBoth(_, _) =>
+                        both = both + 1
+                    VsFromKeyword(_) =>
+                        keywords = keywords + 1
+                        test.assert(h.distance == 0.0)
+                    VsFromVector(_)  => ()
+
+            test.assert(both >= 1)
+            test.assert(keywords >= 1)
+
+@test
+fn test_the_label_guards_of_a_store_answer_an_empty_answer() [io]
+    let c = vsdoc.collection("notes", a_config())
+
+    test.assert(vsstore.id_label(c, 0) == "")
+    test.assert(vsstore.id_label(c, 0 - 1) == "")
+    test.assert(not vsstore.live_label(c, 0))
+    test.assert(not vsstore.live_label(c, 0 - 1))
+    test.assert(json.type_of(vsstore.meta_label(c, 0)) == "object")
+    test.assert(json.type_of(vsstore.meta_label(c, 0 - 1)) == "object")
+    test.assert(vsstore.rank_at([], 0) == 0 - 1)
+    test.assert(vsstore.distance_for([], "absent") == 0.0)

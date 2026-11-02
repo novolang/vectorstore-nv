@@ -1,7 +1,5 @@
 // vsfilter.nv — the metadata predicate language.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.  A filter is a value and evaluating one is
 // arithmetic over a JSON value the caller already holds.
 //
@@ -36,6 +34,8 @@
 
 use std.json
 use std.list
+use std.str
+use vsfault
 
 // One value a filter compares against.
 //
@@ -95,6 +95,335 @@ pub enum VsFilter
     VsNot(part: VsClause)
     VsIs(part: VsClause)
 
+// ── The refusals, and the evaluator ──────────────────────────────────
+
+// Whether a clause's field is a dot path of non-empty names.
+//
+// An empty path, or one with an empty segment, is a caller that meant
+// a field and wrote something else.
+fn is_field_path(f: Str) -> Bool
+    if str.len(f) == 0
+        return false
+    list.all(str.split(f, "."), p => str.len(p) > 0)
+
+// The metadata field a clause reads.
+fn field_of_clause(c: VsClause) -> Str
+    match c
+        VsEq(f, _)       => f
+        VsNe(f, _)       => f
+        VsLt(f, _)       => f
+        VsLte(f, _)      => f
+        VsGt(f, _)       => f
+        VsGte(f, _)      => f
+        VsIn(f, _)       => f
+        VsContains(f, _) => f
+        VsExists(f)      => f
+        VsMissing(f)     => f
+        VsPrefix(f, _)   => f
+
+// The name of a value's type, for a refusal that has to say both sides.
+fn value_type_name(v: VsValue) -> Str
+    match v
+        VsStr(_)   => "string"
+        VsInt(_)   => "number"
+        VsFloat(_) => "number"
+        VsBool(_)  => "boolean"
+
+// The refusal for a pair of types this language does not let meet.
+//
+// Both remote dialects answer false here, which is indistinguishable
+// from "no documents matched", so this package refuses instead.
+fn mismatch(field: Str, have: VsValue, want: VsValue) -> VsFault
+    VsBadFilter(field, "${value_type_name(have)} and ${value_type_name(want)} are not comparable")
+
+// A boolean has no order worth relying on, so an ordering against one
+// is refused rather than answered by whichever server was asked.
+fn check_orderable(f: Str, v: VsValue) -> Result<Int, VsFault>
+    match v
+        VsBool(_) => Err(VsBadFilter(f, "a boolean has no order to compare by"))
+        _         => Ok(1)
+
+// One clause, against the refusals that need no document at all.
+fn check_clause(c: VsClause) -> Result<Int, VsFault>
+    let f = field_of_clause(c)
+    if not is_field_path(f)
+        return Err(VsBadFilter(f, "a field is a dot path of non-empty names"))
+    match c
+        VsLt(_, v)  => check_orderable(f, v)
+        VsLte(_, v) => check_orderable(f, v)
+        VsGt(_, v)  => check_orderable(f, v)
+        VsGte(_, v) => check_orderable(f, v)
+        VsIn(_, vs) =>
+            if list.len(vs) == 0
+                return Err(VsBadFilter(f, "an empty IN matches nothing"))
+            Ok(1)
+        _           => Ok(1)
+
+// Every part of a conjunction.
+fn check_parts(parts: [VsFilter]) -> Result<Int, VsFault>
+    var n = 0
+    for p in parts
+        n = n + check(p)!
+    Ok(n)
+
+// Every part of a conjunction, over one document.
+fn eval_all(parts: [VsFilter], metadata: JsonValueH) -> Result<Bool, VsFault>
+    for p in parts
+        if not eval(p, metadata)!
+            return Ok(false)
+    Ok(true)
+
+// Any part of a disjunction, over one document.
+fn eval_any(parts: [VsFilter], metadata: JsonValueH) -> Result<Bool, VsFault>
+    for p in parts
+        if eval(p, metadata)!
+            return Ok(true)
+    Ok(false)
+
+// Whether the document has the field, JSON null excluded.
+//
+// `VsMissing` is the other half, and the two are exact opposites:
+// absent and null are one state here because the clause that names the
+// state must be able to name both.
+fn has_field(metadata: JsonValueH, field: Str) -> Bool
+    match json.query(metadata, field)
+        None    => false
+        Some(v) => not json.is_null(v)
+
+// The field's scalar value, `None` when the field is absent, null, or
+// an object or array this language cannot compare.
+fn scalar_at(metadata: JsonValueH, field: Str) -> ?VsValue
+    match json.query(metadata, field)
+        None    => None
+        Some(v) =>
+            if json.is_null(v)
+                None
+            else
+                value_of(v)
+
+// The field's text, `None` when it is anything but a string.
+fn text_at(metadata: JsonValueH, field: Str) -> ?Str
+    match json.query(metadata, field)
+        None    => None
+        Some(v) => json.to_str(v)
+
+// Two scalars as equal, or the refusal for a pair of types that are not
+// on one scale.
+fn equal_values(field: Str, have: VsValue, want: VsValue) -> Result<Bool, VsFault>
+    match have
+        VsStr(a)   =>
+            match want
+                VsStr(b) => Ok(a == b)
+                _        => Err(mismatch(field, have, want))
+        VsBool(a)  =>
+            match want
+                VsBool(b) => Ok(a == b)
+                _         => Err(mismatch(field, have, want))
+        VsInt(a)   =>
+            match want
+                VsInt(b)   => Ok(a == b)
+                VsFloat(b) => Ok((a as Float) == b)
+                _          => Err(mismatch(field, have, want))
+        VsFloat(a) =>
+            match want
+                VsFloat(b) => Ok(a == b)
+                VsInt(b)   => Ok(a == (b as Float))
+                _          => Err(mismatch(field, have, want))
+
+// Which of two numbers is the larger: -1, 0 or 1.
+fn order_floats(a: Float, b: Float) -> Int
+    if a < b
+        0 - 1
+    elif a > b
+        1
+    else
+        0
+
+// Which of two integers is the larger.
+fn order_ints(a: Int, b: Int) -> Int
+    if a < b
+        0 - 1
+    elif a > b
+        1
+    else
+        0
+
+// Which of two strings is the larger, byte-lexicographically.
+fn order_strings(a: Str, b: Str) -> Int
+    if a < b
+        0 - 1
+    elif a > b
+        1
+    else
+        0
+
+// Two scalars as ordered, or the refusal.  A boolean is refused: there
+// is no order over one both dialects agree on.
+fn order_values(field: Str, have: VsValue, want: VsValue) -> Result<Int, VsFault>
+    match have
+        VsStr(a)   =>
+            match want
+                VsStr(b) => Ok(order_strings(a, b))
+                _        => Err(mismatch(field, have, want))
+        VsInt(a)   =>
+            match want
+                VsInt(b)   => Ok(order_ints(a, b))
+                VsFloat(b) => Ok(order_floats(a as Float, b))
+                _          => Err(mismatch(field, have, want))
+        VsFloat(a) =>
+            match want
+                VsFloat(b) => Ok(order_floats(a, b))
+                VsInt(b)   => Ok(order_floats(a, b as Float))
+                _          => Err(mismatch(field, have, want))
+        VsBool(_)  => Err(VsBadFilter(field, "a boolean has no order to compare by"))
+
+// Whether one of the values equals the field's.
+fn any_equal(field: Str, have: VsValue, wants: [VsValue]) -> Result<Bool, VsFault>
+    for w in wants
+        if equal_values(field, have, w)!
+            return Ok(true)
+    Ok(false)
+
+// Whether an array field holds the value.  A field that is not an
+// array has no members, and a member that is not a scalar equals
+// nothing.
+fn array_holds(field: Str, arr: JsonValueH, want: VsValue) -> Result<Bool, VsFault>
+    match json.to_list(arr)
+        None     => Ok(false)
+        Some(xs) =>
+            for x in xs
+                match value_of(x)
+                    None    => ()
+                    Some(v) =>
+                        if equal_values(field, v, want)!
+                            return Ok(true)
+            Ok(false)
+
+// One clause, against one document.
+fn eval_clause(c: VsClause, metadata: JsonValueH) -> Result<Bool, VsFault>
+    let field = field_of_clause(c)
+    match c
+        VsExists(_)         => Ok(has_field(metadata, field))
+        VsMissing(_)        => Ok(not has_field(metadata, field))
+        VsPrefix(_, text)   =>
+            match text_at(metadata, field)
+                None    => Ok(false)
+                Some(s) => Ok(str.starts_with(s, text))
+        VsContains(_, want) =>
+            match json.query(metadata, field)
+                None    => Ok(false)
+                Some(v) =>
+                    if json.is_null(v)
+                        Ok(false)
+                    else
+                        array_holds(field, v, want)
+        _                   =>
+            match scalar_at(metadata, field)
+                None       => Ok(false)
+                Some(have) => eval_scalar(c, field, have)
+
+// One comparing clause, against a scalar the field already holds.
+fn eval_scalar(c: VsClause, field: Str, have: VsValue) -> Result<Bool, VsFault>
+    match c
+        VsEq(_, want)  => equal_values(field, have, want)
+        VsNe(_, want)  => Ok(not equal_values(field, have, want)!)
+        VsLt(_, want)  => Ok(order_values(field, have, want)! < 0)
+        VsLte(_, want) => Ok(order_values(field, have, want)! <= 0)
+        VsGt(_, want)  => Ok(order_values(field, have, want)! > 0)
+        VsGte(_, want) => Ok(order_values(field, have, want)! >= 0)
+        VsIn(_, wants) => any_equal(field, have, wants)
+        _              => Ok(false)
+
+// The filter's answer, over one document.
+fn eval(f: VsFilter, metadata: JsonValueH) -> Result<Bool, VsFault>
+    match f
+        VsAll        => Ok(true)
+        VsNone       => Ok(false)
+        VsIs(c)      => eval_clause(c, metadata)
+        VsNot(c)     => Ok(not eval_clause(c, metadata)!)
+        VsAnd(parts) => eval_all(parts, metadata)
+        VsOr(parts)  => eval_any(parts, metadata)
+
+// A conjunction with its redundant structure removed, the parts already
+// simplified.
+fn simplify_and(parts: [VsFilter]) -> VsFilter
+    var kept: [VsFilter] = []
+    for p in parts
+        let s = simplify(p)
+        match s
+            VsNone     =>
+                return VsNone
+            VsAll      => ()
+            VsAnd(sub) =>
+                for q in sub
+                    list.push(kept, q)
+            _          => list.push(kept, s)
+    if list.len(kept) == 0
+        return VsAll
+    if list.len(kept) == 1
+        return kept[0]
+    VsAnd(kept)
+
+// A disjunction with its redundant structure removed.
+fn simplify_or(parts: [VsFilter]) -> VsFilter
+    var kept: [VsFilter] = []
+    for p in parts
+        let s = simplify(p)
+        match s
+            VsAll     =>
+                return VsAll
+            VsNone    => ()
+            VsOr(sub) =>
+                for q in sub
+                    list.push(kept, q)
+            _         => list.push(kept, s)
+    if list.len(kept) == 0
+        return VsNone
+    if list.len(kept) == 1
+        return kept[0]
+    VsOr(kept)
+
+// The parts of a filter, counted at every depth.
+fn count_parts(parts: [VsFilter]) -> Int
+    var n = 0
+    for p in parts
+        n = n + clause_count(p)
+    n
+
+// The fields a filter names, appended to `out` and deduplicated.
+fn fields_into(f: VsFilter, var out: [Str])
+    match f
+        VsAll        => ()
+        VsNone       => ()
+        VsIs(c)      => add_field(var out, field_of_clause(c))
+        VsNot(c)     => add_field(var out, field_of_clause(c))
+        VsAnd(parts) => fields_into_all(parts, var out)
+        VsOr(parts)  => fields_into_all(parts, var out)
+
+// Every part's fields, in order.
+fn fields_into_all(parts: [VsFilter], var out: [Str])
+    for p in parts
+        fields_into(p, var out)
+
+// The field appended when it is not already there.
+fn add_field(var out: [Str], field: Str)
+    if not list.contains(out, field)
+        list.push(out, field)
+
+// Whether every part is satisfiable.
+fn all_satisfiable(parts: [VsFilter]) -> Bool
+    for p in parts
+        if not is_satisfiable(p)
+            return false
+    true
+
+// Whether any part is satisfiable.
+fn any_satisfiable(parts: [VsFilter]) -> Bool
+    for p in parts
+        if is_satisfiable(p)
+            return true
+    false
+
 // A filter from one clause.
 //
 // ```novo
@@ -106,7 +435,7 @@ pub enum VsFilter
 //     // : 1
 // ```
 pub fn is_clause(c: VsClause) -> VsFilter []
-    todo("vectorstore-nv.vsfilter.is_clause")
+    VsIs(c)
 
 // Every clause must hold.
 //
@@ -119,7 +448,7 @@ pub fn is_clause(c: VsClause) -> VsFilter []
 //     // : 1
 // ```
 pub fn all_of(parts: [VsFilter]) -> VsFilter []
-    todo("vectorstore-nv.vsfilter.all_of")
+    VsAnd(parts)
 
 // Any clause may hold.
 //
@@ -132,7 +461,7 @@ pub fn all_of(parts: [VsFilter]) -> VsFilter []
 //     // : 1
 // ```
 pub fn any_of(parts: [VsFilter]) -> VsFilter []
-    todo("vectorstore-nv.vsfilter.any_of")
+    VsOr(parts)
 
 // Whether a filter is well formed, before anything runs it.
 //
@@ -163,12 +492,26 @@ pub fn any_of(parts: [VsFilter]) -> VsFilter []
 //     // : an empty IN matches nothing
 // ```
 pub fn check(f: VsFilter) -> Result<Int, VsFault> []
-    todo("vectorstore-nv.vsfilter.check")
+    match f
+        VsAll        => Ok(0)
+        VsNone       => Ok(0)
+        VsIs(c)      => check_clause(c)
+        VsNot(c)     => check_clause(c)
+        VsAnd(parts) =>
+            if list.len(parts) == 0
+                return Err(VsBadFilter("",
+                    "an empty conjunction is VsAll and an empty disjunction is VsNone, which are opposite answers"))
+            check_parts(parts)
+        VsOr(parts)  =>
+            if list.len(parts) == 0
+                return Err(VsBadFilter("",
+                    "an empty disjunction is VsNone and an empty conjunction is VsAll, which are opposite answers"))
+            check_parts(parts)
 
 // Whether one document's metadata satisfies the filter.
 //
 // The local evaluator, and the definition every remote translation is
-// measured against: `tests/vsfilter_tests.nv` asserts the same filter
+// measured against: `tests/vectorstore_edge_tests.nv` asserts the same filter
 // and the same document through this and through each dialect's
 // translation, which is what keeps the three from drifting.
 //
@@ -183,7 +526,8 @@ pub fn check(f: VsFilter) -> Result<Int, VsFault> []
 //     // : true
 // ```
 pub fn matches(f: VsFilter, metadata: JsonValueH) -> Result<Bool, VsFault> []
-    todo("vectorstore-nv.vsfilter.matches")
+    check(f)!
+    eval(f, metadata)
 
 // How many clauses a filter holds, at every depth.
 //
@@ -199,7 +543,13 @@ pub fn matches(f: VsFilter, metadata: JsonValueH) -> Result<Bool, VsFault> []
 //     // : 0
 // ```
 pub fn clause_count(f: VsFilter) -> Int []
-    todo("vectorstore-nv.vsfilter.clause_count")
+    match f
+        VsAll        => 0
+        VsNone       => 0
+        VsIs(_)      => 1
+        VsNot(_)     => 1
+        VsAnd(parts) => count_parts(parts)
+        VsOr(parts)  => count_parts(parts)
 
 // Every metadata field a filter names, without duplicates.
 //
@@ -214,7 +564,9 @@ pub fn clause_count(f: VsFilter) -> Int []
 //     // : 0
 // ```
 pub fn fields_of(f: VsFilter) -> [Str] []
-    todo("vectorstore-nv.vsfilter.fields_of")
+    var out: [Str] = []
+    fields_into(f, var out)
+    out
 
 // The filter with redundant structure removed.
 //
@@ -231,7 +583,13 @@ pub fn fields_of(f: VsFilter) -> [Str] []
 //     // : 0
 // ```
 pub fn simplify(f: VsFilter) -> VsFilter []
-    todo("vectorstore-nv.vsfilter.simplify")
+    match f
+        VsAll        => VsAll
+        VsNone       => VsNone
+        VsIs(c)      => VsIs(c)
+        VsNot(c)     => VsNot(c)
+        VsAnd(parts) => simplify_and(parts)
+        VsOr(parts)  => simplify_or(parts)
 
 // Whether a filter can match anything at all.
 //
@@ -248,10 +606,21 @@ pub fn simplify(f: VsFilter) -> VsFilter []
 //     // : false
 // ```
 pub fn is_satisfiable(f: VsFilter) -> Bool []
-    todo("vectorstore-nv.vsfilter.is_satisfiable")
+    match f
+        VsAll        => true
+        VsNone       => false
+        VsIs(_)      => true
+        VsNot(_)     => true
+        VsAnd(parts) => all_satisfiable(parts)
+        VsOr(parts)  => any_satisfiable(parts)
 
 // A value from a JSON value, or None for one this language cannot
 // carry.
+//
+// A number keeps what it carries: `7` is `VsInt(7)` and `4.5` is
+// `VsFloat(4.5)`, so a filter compares the number the document holds
+// and not a rounded one.  The rule is std.json's own — no fraction and
+// no exponent is an integer, anything else is a double.
 //
 // An object and an array are not comparable values here, which is the
 // same restriction both remote dialects have.
@@ -267,7 +636,39 @@ pub fn is_satisfiable(f: VsFilter) -> Bool []
 //     // : carried
 // ```
 pub fn value_of(v: JsonValueH) -> ?VsValue []
-    todo("vectorstore-nv.vsfilter.value_of")
+    match json.type_of(v)
+        "string"  =>
+            match json.to_str(v)
+                // cov: skip — `type_of` answered "string", so the reader
+                // cannot miss on the value it just described.
+                None    => None
+                Some(s) => Some(VsStr(s))
+        "boolean" =>
+            match json.to_bool(v)
+                // cov: skip — `type_of` answered "boolean", so the
+                // reader cannot miss here either.
+                None    => None
+                Some(b) => Some(VsBool(b))
+        "number"  =>
+            // THE NUMBER'S OWN TEXT DECIDES, not `json.to_int`: on the
+            // compiled leg that reader truncates a double (4.5 -> 4)
+            // where the interpreter answers None, so asking it would
+            // silently turn a filter's operand into a different number.
+            // The rendered number is unambiguous — an integer prints as
+            // digits and a double carries a fraction or an exponent —
+            // and re-reading it is exact in both directions, a 19-digit
+            // integer included.  Filed as
+            // novo/json-get-int-and-to-int-truncate-a-double-where-the-interpreter-answers-none
+            let text = json.stringify(v)
+            match str.to_int(text)
+                Some(n) => Some(VsInt(n))
+                None    =>
+                    match str.to_float(text)
+                        // cov: skip — `stringify` of a number emits a
+                        // number's text, so the double parse cannot fail
+                        None    => None
+                        Some(x) => Some(VsFloat(x))
+        _         => None
 
 // The value as JSON, for a remote dialect's body.
 //
@@ -280,4 +681,8 @@ pub fn value_of(v: JsonValueH) -> ?VsValue []
 //     // : number
 // ```
 pub fn value_json(v: VsValue) -> JsonValueH []
-    todo("vectorstore-nv.vsfilter.value_json")
+    match v
+        VsStr(s)   => json.string(s)
+        VsInt(n)   => json.int(n)
+        VsFloat(x) => json.float(x)
+        VsBool(b)  => json.bool(b)

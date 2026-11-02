@@ -1,13 +1,11 @@
 // vsvalue_tests.nv — the filter language, the fusion, the collection
 // and the two remote dialects, with no socket and no file.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// vectorstore-nv.<module>.<fn>`.
-
 use std.test
 use std.json
 use std.list
+use std.math
+use std.str
 use hnswparam
 use vsbm25
 use vsdoc
@@ -31,7 +29,7 @@ fn test_an_impossible_filter_is_not_an_empty_shelf() [io]
     // "Your filter cannot match anything" and "nothing in the corpus
     // matched" are different answers, and a store that gave the second
     // for the first hides a bug in a query builder.
-    test.assert(vsfilter.is_satisfiable(VsNone) == false)
+    test.assert(not vsfilter.is_satisfiable(VsNone))
     test.assert(vsfilter.is_satisfiable(VsAll))
 
 @test
@@ -100,6 +98,44 @@ fn test_a_scalar_crosses_into_the_filter_language_and_back() [io]
     match vsfilter.value_of(json.object([]))
         Some(_) => test.assert(false)
         None    => test.assert(true)
+
+    test.case("a boolean and a string are values, carried as themselves")
+    match vsfilter.value_of(json.bool(true))
+        Some(VsBool(b)) => test.assert(b)
+        _               => test.assert(false)
+    match vsfilter.value_of(json.string("en"))
+        Some(VsStr(s)) => test.assert(s == "en")
+        _              => test.assert(false)
+
+@test
+fn test_a_metadata_fraction_reaches_a_filter_as_a_fraction() [io]
+    // A number read through `json.to_int` is truncated on the compiled
+    // leg (4.5 -> 4) where the interpreter answers None, so `score >
+    // 4.2` would answer false against a document every remote dialect
+    // says true for.  A number carries the text of the number, and the
+    // text is what `vsfilter` reads.  Filed as
+    // novo/json-get-int-and-to-int-truncate-a-double-where-the-interpreter-answers-none
+    let meta = json.object([("score", json.float(4.5)),
+                            ("year", json.int(2021))])
+
+    test.case("the fraction survives into the filter language")
+    match vsfilter.value_of(json.float(4.5))
+        Some(VsFloat(x)) => test.assert_eq(x, 4.5)
+        _                => test.assert(false)
+
+    test.case("a whole number is still the integer it was written as")
+    match vsfilter.value_of(json.int(4))
+        Some(VsInt(n)) => test.assert_eq(n, 4)
+        _              => test.assert(false)
+
+    test.case("and a filter compares the number the document holds")
+    match vsfilter.matches(vsfilter.is_clause(VsGt("score", VsFloat(4.2))), meta)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(b)
+
+    match vsfilter.matches(vsfilter.is_clause(VsEq("score", VsFloat(4.5))), meta)
+        Err(_) => test.assert(false)
+        Ok(b)  => test.assert(b)
 
 @test
 fn test_fusion_merges_ranks_and_has_nowhere_to_put_a_score() [io]
@@ -374,7 +410,7 @@ fn test_a_remote_answer_is_read_without_a_socket() [io]
         Err(_) => test.assert(false)
 
     match vshttp.decode_search(c, "{\"ids\":[[]],\"distances\":[[]]}")
-        Ok(o)  => test.assert(o.exhaustive == false)
+        Ok(o)  => test.assert(not o.exhaustive)
         Err(_) => test.assert(true)
 
     match vshttp.decode_get(c, "{\"ids\":[]}")
@@ -386,4 +422,424 @@ fn test_a_remote_answer_is_read_without_a_socket() [io]
 @test
 fn test_a_fault_says_whether_it_is_the_callers_own() [io]
     test.assert(vsfault.is_caller_error(VsDimMismatch(768, 384)))
-    test.assert(vsfault.is_retryable(VsNoSuchDoc("a")) == false)
+    test.assert(not vsfault.is_retryable(VsNoSuchDoc("a")))
+
+@test
+fn test_a_token_is_a_word_or_a_number_and_nothing_between() [io]
+    // UAX #29 hands back the spaces and the punctuation too; a term is
+    // the words and the numbers, and the two rules after that are the
+    // empty segment and the minimum length.
+    let t = vsbm25.tokenizer()
+
+    test.case("a number is a term")
+    test.assert(list.contains(vsbm25.tokenize(t, "the year 2021"), "2021"))
+
+    test.case("an empty segment and a segment under the minimum are dropped")
+    test.assert(not vsbm25.kept(t, ""))
+    let strict = VsTokenizer { fold_case: true, min_length: 3, stop_words: [] }
+    test.assert(not vsbm25.kept(strict, "ab"))
+    test.assert(vsbm25.kept(strict, "abc"))
+
+@test
+fn test_an_index_that_never_saw_a_term_and_holds_nothing() [io]
+    let ix = vsbm25.empty_index()
+
+    test.case("a term that is not in the index occurs zero times")
+    test.assert(vsbm25.tf_of(ix, "absent", 0) == 0)
+
+    test.case("an index with no documents has no average length")
+    test.assert(vsbm25.average_length(ix) == 0.0)
+
+@test
+fn test_every_fault_says_whether_the_caller_caused_it_and_prints_both_sides() [io]
+    // A caller retries a transport failure and fixes its own request,
+    // and `message` is what a person reads when neither is obvious.
+    let mine: [VsFault] = [VsDimMismatch(768, 384), VsModelMismatch("a", "b"),
+                           VsNotFinite("x", 2), VsNoSuchDoc("x"), VsDuplicateId("x"),
+                           VsBadFilter("f", "why"), VsUnsupportedQuery("what")]
+    for f in mine
+        test.assert(vsfault.is_caller_error(f))
+        test.assert(f.message() != "")
+
+    // The other six are not the caller's to fix: a file that is not a
+    // collection, a disk that refused, an index that refused, and
+    // whatever the far end said or failed to say.
+    let theirs: [VsFault] = [VsBadFile("why"), VsIoFailed("/p", "why"), VsIndexFailed("why"),
+                             VsRemoteFailed(404, "code", "why"), VsTransportFailed("why"),
+                             VsMalformedReply("what")]
+    for f in theirs
+        test.assert(not vsfault.is_caller_error(f))
+        test.assert(f.message() != "")
+
+@test
+fn test_a_fusion_weighs_the_lists_it_names_and_refuses_to_guess() [io]
+    let two = vsrank.fusion(10, [1.0, 2.0])
+
+    test.case("a weight the fusion names is the weight it uses")
+    test.assert(vsrank.weight_at(two, 1) == 2.0)
+
+    test.case("a list it does not name is worth one")
+    test.assert(vsrank.weight_at(two, 2) == 1.0)
+    test.assert(vsrank.weight_at(vsrank.default_fusion(), 0) == 1.0)
+
+    test.case("a weighted fusion scores by them")
+    let hits = vsrank.fuse(two, [vsrank.ranking(["x", "y"]), vsrank.ranking(["y", "x"])])
+    test.assert(list.len(hits) == 2)
+
+    test.case("a weights list that names every list is accepted")
+    match vsrank.check(two, 2)
+        Ok(k)  => test.assert(k == 10)
+        Err(_) => test.assert(false)
+
+    test.case("and one that names some of them is refused rather than guessed")
+    match vsrank.check(two, 3)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("two rankings with nothing to share agree on nothing")
+    test.assert(vsrank.overlap(vsrank.ranking([]), vsrank.ranking(["a"]), 10) == 0.0)
+
+@test
+fn test_the_filter_language_refuses_every_pair_of_types_it_cannot_compare() [io]
+    test.case("a field path with an empty segment is not a path")
+    test.assert(not vsfilter.is_field_path(""))
+    test.assert(not vsfilter.is_field_path("a..b"))
+    test.assert(vsfilter.is_field_path("a.b"))
+
+    test.case("a value's type is named so the refusal can print both sides")
+    test.assert(vsfilter.value_type_name(VsFloat(1.0)) == "number")
+    test.assert(vsfilter.value_type_name(VsBool(true)) == "boolean")
+
+    test.case("a boolean has no order, so an ordering against one is refused")
+    match vsfilter.check_orderable("ok", VsBool(true))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match vsfilter.check_orderable("year", VsInt(1))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("equality between two types that are not on one scale")
+    match vsfilter.equal_values("f", VsStr("a"), VsInt(1))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match vsfilter.equal_values("f", VsBool(true), VsStr("a"))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match vsfilter.equal_values("f", VsInt(1), VsBool(true))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match vsfilter.equal_values("f", VsFloat(1.0), VsStr("a"))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and two numbers compare across the two number types")
+    match vsfilter.equal_values("f", VsInt(1), VsFloat(1.0))
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+
+    test.case("ordering is three-way and never invented")
+    test.assert(vsfilter.order_floats(1.0, 2.0) < 0)
+    test.assert(vsfilter.order_floats(2.0, 1.0) > 0)
+    test.assert(vsfilter.order_floats(2.0, 2.0) == 0)
+    test.assert(vsfilter.order_ints(2, 1) > 0)
+    test.assert(vsfilter.order_strings("a", "b") < 0)
+    test.assert(vsfilter.order_strings("b", "a") > 0)
+    test.assert(vsfilter.order_strings("a", "a") == 0)
+
+    match vsfilter.order_values("f", VsStr("a"), VsInt(1))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match vsfilter.order_values("f", VsInt(1), VsFloat(2.0))
+        Ok(n)  => test.assert(n < 0)
+        Err(_) => test.assert(false)
+    match vsfilter.order_values("f", VsFloat(2.0), VsInt(1))
+        Ok(n)  => test.assert(n > 0)
+        Err(_) => test.assert(false)
+    match vsfilter.order_values("f", VsFloat(2.0), VsStr("a"))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match vsfilter.order_values("f", VsBool(true), VsInt(1))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_types_a_document_can_hold_are_compared_at_their_own_width() [io]
+    // The accepting half of the refusals above: the two sides of an
+    // equality are compared as the types they are, and the two number
+    // types meet each other by value instead of by spelling.
+    match vsfilter.equal_values("flag", VsBool(true), VsBool(true))
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+    match vsfilter.equal_values("year", VsInt(2021), VsInt(2021))
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+    match vsfilter.equal_values("score", VsFloat(1.0), VsInt(1))
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+
+    test.case("two equal integers have no order between them")
+    test.assert(vsfilter.order_ints(2, 2) == 0)
+
+    test.case("two strings are ordered byte-lexicographically")
+    match vsfilter.order_values("lang", VsStr("da"), VsStr("sv"))
+        Ok(n)  => test.assert(n < 0)
+        Err(_) => test.assert(false)
+
+    test.case("a clause whose field path is malformed is refused before any document")
+    match vsfilter.check_clause(VsEq("a..b", VsInt(1)))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+    match vsfilter.check_clause(VsEq("a.b", VsInt(1)))
+        Ok(_)  => test.assert(true)
+        Err(_) => test.assert(false)
+
+    test.case("a field that is not an array holds nothing")
+    match vsfilter.array_holds("tags", json.int(1), VsInt(1))
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    test.case("and a member that is not a scalar equals nothing")
+    let nested = json.array([json.object([("a", json.int(1))]), json.null()])
+    match vsfilter.array_holds("tags", nested, VsInt(1))
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+@test
+fn test_the_ways_a_field_can_be_missing_are_all_a_no() [io]
+    let meta = json.object([("year", json.int(2021)), ("nulled", json.null())])
+
+    test.case("a field with no member is not there")
+    test.assert(not vsfilter.has_field(meta, "absent"))
+    test.assert(vsfilter.has_field(meta, "year"))
+
+    test.case("a null and an absent field are one state for a comparison")
+    match vsfilter.scalar_at(meta, "nulled")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    match vsfilter.scalar_at(meta, "absent")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+    test.case("text is only a string's")
+    match vsfilter.text_at(meta, "absent")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    match vsfilter.text_at(meta, "year")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+    match vsfilter.text_at(meta, "nulled")
+        None    => test.assert(true)
+        Some(_) => test.assert(false)
+
+@test
+fn test_a_clause_over_a_field_it_cannot_read_answers_false() [io]
+    let meta = json.object([("year", json.int(2021)), ("nulled", json.null()),
+                            ("tags", json.array([json.string("a"), json.string("b")])),
+                            ("mixed", json.array([json.string("a"), json.int(2)]))])
+
+    test.case("a prefix needs a string, and a number has none")
+    match vsfilter.eval_clause(VsPrefix("year", "20"), meta)
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    match vsfilter.eval_clause(VsPrefix("absent", "20"), meta)
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    test.case("contains needs an array, and a null and an absent field are not one")
+    match vsfilter.eval_clause(VsContains("nulled", VsInt(1)), meta)
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    match vsfilter.eval_clause(VsContains("absent", VsInt(1)), meta)
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    test.case("an array holds a member of the same type, and only that")
+    match vsfilter.eval_clause(VsContains("tags", VsStr("a")), meta)
+        Ok(b)  => test.assert(b)
+        Err(_) => test.assert(false)
+
+    match vsfilter.eval_clause(VsContains("tags", VsStr("z")), meta)
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    test.case("and a member of another type is the refusal a field of one would be")
+    // The no-implicit-coercion rule, one level down: a question about a
+    // number is not answered by walking past the strings in the array.
+    match vsfilter.eval_clause(VsContains("tags", VsInt(2)), meta)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match vsfilter.eval_clause(VsContains("mixed", VsInt(2)), meta)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a comparison against a field that is not there is false, not a fault")
+    match vsfilter.eval_clause(VsGt("absent", VsInt(1)), meta)
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+    test.case("and a clause that is not a comparison has no scalar answer to give")
+    match vsfilter.eval_scalar(VsExists("year"), "year", VsInt(2021))
+        Ok(b)  => test.assert(not b)
+        Err(_) => test.assert(false)
+
+@test
+fn test_a_filter_is_simplified_by_what_its_parts_say() [io]
+    let c = vsfilter.is_clause(VsEq("lang", VsStr("da")))
+    let d = vsfilter.is_clause(VsEq("year", VsInt(2021)))
+
+    test.case("a conjunction with an impossible part is impossible")
+    match vsfilter.simplify_and([VsAll, VsNone, c])
+        VsNone => test.assert(true)
+        _      => test.assert(false)
+
+    test.case("an empty conjunction says nothing")
+    match vsfilter.simplify_and([])
+        VsAll => test.assert(true)
+        _     => test.assert(false)
+
+    test.case("a nested conjunction is flattened")
+    match vsfilter.simplify_and([vsfilter.all_of([c, d])])
+        VsAnd(parts) => test.assert(list.len(parts) == 2)
+        _            => test.assert(false)
+
+    test.case("a disjunction with a part that always holds always holds")
+    match vsfilter.simplify_or([VsNone, VsAll, c])
+        VsAll => test.assert(true)
+        _     => test.assert(false)
+
+    test.case("an empty disjunction says no")
+    match vsfilter.simplify_or([VsNone, VsNone])
+        VsNone => test.assert(true)
+        _      => test.assert(false)
+
+    test.case("a nested disjunction is flattened")
+    match vsfilter.simplify_or([vsfilter.any_of([c, d])])
+        VsOr(parts) => test.assert(list.len(parts) == 2)
+        _           => test.assert(false)
+
+    test.case("and one part alone is that part")
+    match vsfilter.simplify_or([c])
+        VsIs(_) => test.assert(true)
+        _       => test.assert(false)
+
+@test
+fn test_a_filter_counts_its_clauses_and_names_its_fields_at_every_depth() [io]
+    let c = vsfilter.is_clause(VsEq("lang", VsStr("da")))
+    let d = vsfilter.is_clause(VsGt("year", VsInt(2020)))
+
+    test.assert(vsfilter.clause_count(VsAll) == 0)
+    test.assert(vsfilter.clause_count(VsNone) == 0)
+    test.assert(vsfilter.clause_count(c) == 1)
+    test.assert(vsfilter.clause_count(VsNot(VsEq("lang", VsStr("da")))) == 1)
+    test.assert(vsfilter.clause_count(vsfilter.any_of([c, d])) == 2)
+
+    test.assert(list.len(vsfilter.fields_of(VsAll)) == 0)
+    test.assert(list.len(vsfilter.fields_of(VsNone)) == 0)
+    test.assert(list.len(vsfilter.fields_of(VsNot(VsEq("lang", VsStr("da"))))) == 1)
+    test.assert(list.len(vsfilter.fields_of(vsfilter.any_of([c, d]))) == 2)
+
+@test
+fn test_a_filter_is_satisfiable_exactly_when_some_document_could_match_it() [io]
+    let c = vsfilter.is_clause(VsEq("lang", VsStr("da")))
+
+    test.assert(vsfilter.is_satisfiable(c))
+    test.assert(vsfilter.is_satisfiable(VsNot(VsEq("lang", VsStr("da")))))
+    test.assert(not vsfilter.is_satisfiable(VsNone))
+    test.assert(vsfilter.is_satisfiable(vsfilter.all_of([c])))
+    test.assert(not vsfilter.is_satisfiable(vsfilter.all_of([c, VsNone])))
+    test.assert(vsfilter.is_satisfiable(vsfilter.any_of([VsNone, c])))
+    test.assert(not vsfilter.is_satisfiable(vsfilter.any_of([VsNone])))
+
+@test
+fn test_a_fraction_crosses_into_json_as_a_fraction() [io]
+    // The other direction of the same rule `value_of` reads: a double
+    // must not be written as a rounded integer.
+    let j = vsfilter.value_json(VsFloat(1.5))
+
+    test.assert(json.type_of(j) == "number")
+    match json.to_float(j)
+        Some(x) => test.assert(x == 1.5)
+        None    => test.assert(false)
+
+@test
+fn test_the_marked_list_loses_only_the_id_that_came_back() [io]
+    // The id mapping again, one level down: a delete pushes an id onto
+    // the marked list and an upsert of that id removes exactly that
+    // one.  A rebuild that cleared the whole list would un-mark every
+    // other deletion in the collection, and the vectors would be back.
+    var c = vsdoc.collection("notes", a_config())
+    match vsdoc.upsert_many(c, [vsdoc.doc("a", "denmark", [0.1, 1.0]),
+                                vsdoc.doc("b", "sweden", [0.5, 1.0]),
+                                vsdoc.doc("c", "norway", [0.9, 1.0])],
+                                "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+
+    for id in ["a", "b"]
+        match vsdoc.delete(c, id)
+            Err(_)   => test.assert(false)
+            Ok(next) =>
+                c = next
+
+    match vsdoc.upsert(c, vsdoc.doc("a", "denmark", [0.1, 1.0]), "test-model")
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            c = next
+
+    test.assert(vsdoc.deleted_count(c) == 1)
+    test.assert(list.len(vsdoc.ids(c)) == 2)
+    test.case("and the one that is still marked is 'b'")
+    test.assert(list.first(vsdoc.ids(c)) == Some("a"))
+
+@test
+fn test_a_batch_stops_at_the_first_document_it_cannot_take() [io]
+    // The documents before it are not rolled back and the one that
+    // failed is not silently dropped: the caller gets the fault and
+    // the forty-nine documents that went in stay in.
+    var c = vsdoc.collection("notes", a_config())
+    match vsdoc.upsert_many(c, [vsdoc.doc("a", "denmark", [0.1, 1.0]),
+                                vsdoc.doc("b", "sweden", [0.5, 1.0, 9.0])],
+                                "test-model")
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(vsdoc.doc_count(c) == 0)
+
+@test
+fn test_a_compact_takes_the_uniforms_the_index_wants_and_reuses_the_named_ones() [io]
+    // `compact` rebuilds the graph, so it needs the uniform each insert
+    // draws.  A caller that names them gets the same graph twice.
+    var c = vsdoc.collection("notes", a_config())
+    match vsdoc.upsert_many(c, [vsdoc.doc("a", "denmark", [0.1, 1.0]),
+                                vsdoc.doc("b", "sweden", [0.5, 1.0]),
+                                vsdoc.doc("c", "norway", [0.9, 1.0])],
+                                "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+    match vsdoc.delete(c, "b")
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            c = next
+
+    match vsdoc.compact(c, [0.5, 0.25])
+        Err(_)      => test.assert(false)
+        Ok(smaller) =>
+            test.case("the marked document is gone and the live ones are still there")
+            test.assert(vsdoc.doc_count(smaller) == 2)
+            test.assert(vsdoc.deleted_count(smaller) == 0)
+
+@test
+fn test_a_coordinate_that_is_not_a_number_is_refused_in_the_document_s_own_name() [io]
+    // A NaN coordinate makes every distance NaN and the document is
+    // simply never the nearest — a silent disappearance, so it is
+    // caught on the way in and named.
+    let c = vsdoc.collection("notes", a_config())
+
+    match vsdoc.upsert(c, vsdoc.doc("b", "sweden", [0.5, math.nan()]), "test-model")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("and the fault names the document and the coordinate")
+            test.assert(str.contains(f.message(), "b"))

@@ -1,7 +1,5 @@
 // vsfile.nv — a collection on disk.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[fs]`, and only here.  The format is `[]` — `to_bytes` and
 // `from_bytes` are published beside the file calls, so a caller that
 // keeps its collection in a database column, an object store or a zip
@@ -27,7 +25,45 @@
 // `vshttp`.  That line is stated here rather than discovered at the
 // size where it starts mattering.
 
+use std.bytes
+use std.float
+use std.json
 use std.list
+use hnswdist
+use hnswio
+use hnswparam
+use vsbm25
+use vsdoc
+use vsfault
+use vssearch
+use vsstore
+
+// The layout, with every integer a big-endian 64-bit value unless it
+// says otherwise:
+//
+//     offset  field
+//     0       magic, 4 bytes: "NVVS"
+//     4       format version, 32 bits
+//     8       total bytes, this prefix included
+//     16      the header section's length
+//     24      the index section's length
+//     32      the documents section's length
+//     40      the header: JSON, one object
+//             the index: hnsw-nv's own serialised form, verbatim
+//             the documents: a count, then per document its id, its
+//             text, its vector as raw float bits and its metadata as
+//             JSON
+//
+// The three sections are what make `peek_header` a prefix read rather
+// than a load: a caller can ask which model built a collection of a
+// million vectors without materialising one of them.
+//
+// **THE VECTORS ARE BITS, NOT NUMBERS.**  A vector written as JSON
+// text would be re-parsed as whatever the writer rounded to, and the
+// index beside it would hold the exact values — so a pre-filter would
+// compare and a graph walk would rank against two different vectors
+// for one document.  `float.to_bits` is exact in both directions.
+const PREFIX_BYTES = 40
 
 // The magic the file begins with.
 //
@@ -48,7 +84,7 @@ pub const VS_FILE_VERSION = 1
 //     // : 1
 // ```
 pub fn supported_versions() -> [Int] []
-    todo("vectorstore-nv.vsfile.supported_versions")
+    [VS_FILE_VERSION]
 
 // What a file's header says, without reading the rest of it.
 pub struct VsFileHeader
@@ -79,7 +115,21 @@ pub struct VsFileHeader
 //         Err(_) => false
 // ```
 pub fn to_bytes(c: VsCollection) -> Result<Bytes, VsFault> []
-    todo("vectorstore-nv.vsfile.to_bytes")
+    let hb = bytes.from_str(header_json(c))
+    let ix = index_bytes(c.index)!
+    let db = docs_bytes(c)
+    let total = PREFIX_BYTES + bytes.len(hb) + bytes.len(ix) + bytes.len(db)
+    var parts: [Bytes] = []
+    parts = list.push(parts, bytes.from_str(VS_FILE_MAGIC))
+    parts = list.push(parts, bytes.u32_be(VS_FILE_VERSION))
+    parts = list.push(parts, bytes.u64_be(total))
+    parts = list.push(parts, bytes.u64_be(bytes.len(hb)))
+    parts = list.push(parts, bytes.u64_be(bytes.len(ix)))
+    parts = list.push(parts, bytes.u64_be(bytes.len(db)))
+    parts = list.push(parts, bytes.clone(hb))
+    parts = list.push(parts, bytes.clone(ix))
+    parts = list.push(parts, bytes.clone(db))
+    Ok(bytes.concat(parts))
 
 // A collection from bytes.
 //
@@ -95,7 +145,29 @@ pub fn to_bytes(c: VsCollection) -> Result<Bytes, VsFault> []
 //         Err(_) => false
 // ```
 pub fn from_bytes(b: Bytes) -> Result<VsCollection, VsFault> []
-    todo("vectorstore-nv.vsfile.from_bytes")
+    let p = parse_prefix(b)!
+    let hb = section(b, PREFIX_BYTES, p.header_len, "header")!
+    let doc = parse_json(hb, "header")!
+    // The index is asked what it was built for and the answer is
+    // compared with the header's, before either is believed.  A file
+    // whose header and index disagree is one whose dimension would be
+    // read from one and whose distances computed by the other — and
+    // nothing downstream would say so.
+    let ix = index_from(section(b, PREFIX_BYTES + p.header_len, p.index_len, "index")!)!
+    let dim = field_int(doc, "dim")!
+    let metric = metric_from(doc)!
+    if ix.params.dim != dim or ix.params.metric != metric
+        return Err(VsBadFile("its index was built for another collection"))
+    let cfg = config_from(doc)!
+    let section_at = PREFIX_BYTES + p.header_len + p.index_len
+    var dr = reader(section(b, section_at, p.docs_len, "documents")!)
+    let n = dr.u64()!
+    let docs = docs_from(var dr, n)!
+    let deleted = deleted_from(doc)!
+    let keywords = keywords_of(docs, cfg)!
+    let name = field_str(doc, "name")!
+    Ok(VsCollection { name: name, config: cfg, docs: docs, index: ix, keywords: keywords,
+                      deleted: deleted })
 
 // The header a buffer starts with.
 //
@@ -112,7 +184,10 @@ pub fn from_bytes(b: Bytes) -> Result<VsCollection, VsFault> []
 //         Err(_) => false
 // ```
 pub fn peek_header(b: Bytes) -> Result<VsFileHeader, VsFault> []
-    todo("vectorstore-nv.vsfile.peek_header")
+    let p = parse_prefix(b)!
+    let hb = section(b, PREFIX_BYTES, p.header_len, "header")!
+    let doc = parse_json(hb, "header")!
+    header_from(doc, p)
 
 // How large the file will be.
 //
@@ -129,7 +204,14 @@ pub fn peek_header(b: Bytes) -> Result<VsFileHeader, VsFault> []
 //         Err(_) => 0
 // ```
 pub fn size_bound(c: VsCollection) -> Result<Int, VsFault> []
-    todo("vectorstore-nv.vsfile.size_bound")
+    // EXACT, not an estimate: the three sections are built and
+    // measured rather than concatenated, so the number a caller
+    // checks its free space against is the number the file will be.
+    // The cost is the sections without the copy of them.
+    let hb = bytes.from_str(header_json(c))
+    let ix = index_bytes(c.index)!
+    let db = docs_bytes(c)
+    Ok(PREFIX_BYTES + bytes.len(hb) + bytes.len(ix) + bytes.len(db))
 
 // Whether a buffer is a collection file.
 //
@@ -142,7 +224,9 @@ pub fn size_bound(c: VsCollection) -> Result<Int, VsFault> []
 //     vsfile.is_collection(b)
 // ```
 pub fn is_collection(b: Bytes) -> Bool []
-    todo("vectorstore-nv.vsfile.is_collection")
+    if bytes.len(b) < 4
+        return false
+    bytes.to_str(bytes.slice(b, 0, 4)) == VS_FILE_MAGIC
 
 // Write a collection to a path.
 //
@@ -160,7 +244,23 @@ pub fn is_collection(b: Bytes) -> Bool []
 //     vsfile.save(c, path)
 // ```
 pub fn save(c: VsCollection, path: Str) -> Result<Int, VsFault> [fs]
-    todo("vectorstore-nv.vsfile.save")
+    let b = to_bytes(c)!
+    let tmp = path + ".novo-tmp"
+    let Some(fd) = fs.open_write(tmp) else
+        return Err(VsIoFailed(tmp, "cannot be opened for writing"))
+    let written = fs.write_at(fd, 0, bytes.to_byte_list(b))
+    fs.close(fd)
+    match written
+        Some(err) =>
+            return Err(VsIoFailed(tmp, err))
+        None      => ()
+    // The rename is the whole point: a process that died during the
+    // write leaves the previous collection where it was, and the
+    // only thing it can leave behind is a temporary file with a
+    // recognisable name.
+    if not fs.rename(tmp, path)
+        return Err(VsIoFailed(path, "the temporary file could not be renamed over it"))
+    Ok(bytes.len(b))
 
 // Read a collection from a path.
 //
@@ -173,7 +273,9 @@ pub fn save(c: VsCollection, path: Str) -> Result<Int, VsFault> [fs]
 //     vsfile.load(path)
 // ```
 pub fn load(path: Str) -> Result<VsCollection, VsFault> [fs]
-    todo("vectorstore-nv.vsfile.load")
+    match fs.read_bytes(path)
+        None    => Err(VsIoFailed(path, "cannot be read"))
+        Some(b) => from_bytes(b)
 
 // A file's header, without reading the vectors.
 //
@@ -187,7 +289,27 @@ pub fn load(path: Str) -> Result<VsCollection, VsFault> [fs]
 //     vsfile.read_header(path)
 // ```
 pub fn read_header(path: Str) -> Result<VsFileHeader, VsFault> [fs]
-    todo("vectorstore-nv.vsfile.read_header")
+    let Some(fd) = fs.open_read(path) else
+        return Err(VsIoFailed(path, "cannot be opened for reading"))
+    // One close and one answer, whatever the header turns out to say.
+    let out = header_at(fd, path)
+    fs.close(fd)
+    out
+
+// The prefix and the header, and not one byte more.
+fn header_at(fd: Int, path: Str) -> Result<VsFileHeader, VsFault> [fs]
+    let head = fs.read_at(fd, 0, PREFIX_BYTES)
+    if head == None
+        return Err(VsBadFile("${path} is shorter than its ${PREFIX_BYTES}-byte prefix"))
+    let p = parse_prefix(bytes.from_byte_list(head ?? []))!
+    // The read is sized from the file, never from a length the file states
+    // about itself.
+    let have = fs.size(path) ?? 0
+    if p.header_len < 0 or p.header_len > have - PREFIX_BYTES
+        return Err(VsBadFile("${path}: the header runs past the end of the file"))
+    let hb = fs.read_at(fd, PREFIX_BYTES, p.header_len)
+    let doc = parse_json(bytes.from_byte_list(hb ?? []), "header")!
+    header_from(doc, p)
 
 // Whether a path holds a collection this package can read.
 //
@@ -202,7 +324,15 @@ pub fn read_header(path: Str) -> Result<VsFileHeader, VsFault> [fs]
 //     vsfile.is_collection_file(path)
 // ```
 pub fn is_collection_file(path: Str) -> Bool [fs]
-    todo("vectorstore-nv.vsfile.is_collection_file")
+    // Four bytes, and a path that is not there answers false: a
+    // question, not a failed load.
+    let Some(fd) = fs.open_read(path) else
+        return false
+    let head = fs.read_at(fd, 0, 4)
+    fs.close(fd)
+    match head
+        None     => false
+        Some(bs) => is_collection(bytes.from_byte_list(bs))
 
 // A store backed by a file, loaded once and written on demand.
 //
@@ -213,8 +343,10 @@ pub fn is_collection_file(path: Str) -> Bool [fs]
 pub struct VsFileStore
     memory: VsMemory
     path: Str
-    // Whether the in-memory collection differs from the file.
-    dirty: Bool
+    // Whether the in-memory collection differs from the file.  The one
+    // field here that is written, and the reason `flush` takes the
+    // store through a `var` name.
+    var dirty: Bool
 
 // Open a collection from a path, or create an empty one.
 //
@@ -227,7 +359,15 @@ pub struct VsFileStore
 //     vsfile.open(path, "notes", c)
 // ```
 pub fn open(path: Str, name: Str, config: VsConfig) -> Result<VsFileStore, VsFault> [fs]
-    todo("vectorstore-nv.vsfile.open")
+    if is_collection_file(path)
+        let loaded = load(path)!
+        let m = vsstore.memory(loaded)
+        return Ok(VsFileStore { memory: m, path: path, dirty: false })
+    // A path that is not a collection yet is an empty one rather than
+    // a fault, and the file is written when something is in it: a
+    // fresh open has nothing pending, so `flush` writes nothing.
+    let fresh = vsstore.memory(vsdoc.collection(name, config))
+    Ok(VsFileStore { memory: fresh, path: path, dirty: false })
 
 // Write the collection if it has changed.
 //
@@ -241,7 +381,22 @@ pub fn open(path: Str, name: Str, config: VsConfig) -> Result<VsFileStore, VsFau
 //     vsfile.flush(s)
 // ```
 pub fn flush(s: VsFileStore) -> Result<Bool, VsFault> [fs]
-    todo("vectorstore-nv.vsfile.flush")
+    var shared = s
+    flush_in(var shared)
+
+// A `VsFileStore` is a reference, so `var shared = s` names the caller's own
+// store and the write to `dirty` reaches the caller.
+fn flush_in(var s: VsFileStore) -> Result<Bool, VsFault> [fs]
+    if not s.dirty
+        return Ok(false)
+    let _ = save(s.memory.collection, s.path)!
+    s.dirty = false
+    Ok(true)
+
+// Mark the store as differing from the file, through a `var` name the
+// caller's own binding shares.
+fn mark_dirty(var s: VsFileStore)
+    s.dirty = true
 
 // A file-backed store performs `[fs]`.
 //
@@ -258,17 +413,284 @@ pub fn flush(s: VsFileStore) -> Result<Bool, VsFault> [fs]
 //     s.vs_search(q)
 // ```
 impl VsStore[fs] for VsFileStore
+    // The memory store does the work and this store remembers that the
+    // file is now behind.  `let m = self.memory` is a reference to the
+    // same `VsMemory` the field holds, so a write through it is a
+    // write to the store — and `self.memory` is not a `var` name
+    // because none of these methods needs one.
     fn vs_upsert(self, docs: [VsDoc]) -> Result<Int, VsFault> [fs]
-        todo("vectorstore-nv.vsfile.VsFileStore.vs_upsert")
+        let m = self.memory
+        let n = m.vs_upsert(docs)!
+        if n > 0
+            var shared = self
+            mark_dirty(var shared)
+        Ok(n)
 
     fn vs_delete(self, ids: [Str]) -> Result<Int, VsFault> [fs]
-        todo("vectorstore-nv.vsfile.VsFileStore.vs_delete")
+        let m = self.memory
+        let n = m.vs_delete(ids)!
+        if n > 0
+            var shared = self
+            mark_dirty(var shared)
+        Ok(n)
 
     fn vs_get(self, ids: [Str]) -> Result<[VsDoc], VsFault> [fs]
-        todo("vectorstore-nv.vsfile.VsFileStore.vs_get")
+        let m = self.memory
+        m.vs_get(ids)
 
     fn vs_search(self, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [fs]
-        todo("vectorstore-nv.vsfile.VsFileStore.vs_search")
+        let m = self.memory
+        m.vs_search(q)
 
     fn vs_count(self) -> Result<Int, VsFault> [fs]
-        todo("vectorstore-nv.vsfile.VsFileStore.vs_count")
+        let m = self.memory
+        m.vs_count()
+
+// The header as JSON, which is every field of the collection that is
+// not a document.
+//
+// The level multiplier goes in as its raw bits: it is a float that
+// came out of `hnswparam.default_level_multiplier`, it is compared
+// for exact equality when an index is rebuilt, and a JSON writer's
+// rounding would be a file that no longer describes the index in it.
+fn header_json(c: VsCollection) -> Str
+    var del: [Any] = []
+    list.append(del, list.map(c.deleted, id => json.string(id)))
+    json.stringify(json.object([
+        ("name", json.string(c.name)),
+        ("dim", json.int(c.config.dim)),
+        ("metric", json.string(hnswdist.metric_name(c.config.metric))),
+        ("model", json.string(c.config.model)),
+        ("keyword_index", json.bool(c.config.keyword_index)),
+        ("m", json.int(c.config.params.m)),
+        ("ef_construction", json.int(c.config.params.ef_construction)),
+        ("capacity", json.int(c.config.params.capacity)),
+        ("level_multiplier_bits", json.int(float.to_bits(c.config.params.level_multiplier))),
+        ("doc_count", json.int(vsdoc.doc_count(c))),
+        ("deleted", json.array(del))]))
+
+// What `peek_header` and `read_header` answer, from a parsed header.
+fn header_from(doc: JsonValueH, p: Prefix) -> Result<VsFileHeader, VsFault> []
+    Ok(VsFileHeader { version: p.version, name: field_str(doc, "name")!,
+                      dim: field_int(doc, "dim")!, model: field_str(doc, "model")!,
+                      doc_count: field_int(doc, "doc_count")!,
+                      deleted_count: list.len(deleted_from(doc)!), total_bytes: p.total })
+
+// The collection's configuration, from a parsed header.
+//
+// THE `keyword_index` FLAG IS THE ONE FIELD A READER CANNOT RECOVER
+// FROM ANYWHERE ELSE.  A config built without it reloads a collection
+// whose header says `true` and whose keyword index is then rebuilt as
+// empty — a hybrid search on the reopened file answers
+// `VsUnsupportedQuery` for a collection whose file says it has one.
+// Caught by the round-trip test in `tests/vsio_tests.nv`.
+fn config_from(doc: JsonValueH) -> Result<VsConfig, VsFault> []
+    let dim = field_int(doc, "dim")!
+    let metric = metric_from(doc)!
+    let model = field_str(doc, "model")!
+    let kwi = field_bool(doc, "keyword_index")!
+    let p = params_of(dim, metric, field_int(doc, "m")!,
+                      field_int(doc, "ef_construction")!, field_int(doc, "capacity")!,
+                      field_float_bits(doc, "level_multiplier_bits")!)!
+    let base = vsdoc.config(dim, metric, model, p)
+    if kwi
+        Ok(vsdoc.with_keyword_index(base))
+    else
+        Ok(base)
+
+fn metric_from(doc: JsonValueH) -> Result<HnswMetric, VsFault> []
+    let name = field_str(doc, "metric")!
+    match hnswdist.metric_of_name(name)
+        Some(m) => Ok(m)
+        None    => Err(VsBadFile("an unknown metric: ${name}"))
+
+fn params_of(dim: Int, metric: HnswMetric, m: Int, efc: Int, cap: Int,
+             ml: Float) -> Result<HnswParams, VsFault> []
+    let base = match hnswparam.params(dim, metric, m, efc, cap)
+        Err(f) =>
+            return Err(VsIndexFailed(hnswfault_text(f)))
+        Ok(p)  => p
+    match hnswparam.with_level_multiplier(base, ml)
+        Ok(p)  => Ok(p)
+        Err(f) => Err(VsIndexFailed(hnswfault_text(f)))
+
+fn deleted_from(doc: JsonValueH) -> Result<[Str], VsFault> []
+    let listv = json.get(doc, "deleted")
+    if listv == None
+        return Err(VsBadFile("the header has no deleted list"))
+    let members = json.to_list(listv ?? json.null())
+    if members == None
+        return Err(VsBadFile("the header's deleted is not an array"))
+    var out: [Str] = []
+    for m in members ?? []
+        match json.to_str(m)
+            None    =>
+                return Err(VsBadFile("an id in the header is not a string"))
+            Some(s) => ()
+        out = list.push(out, json.to_str(m) ?? "")
+    Ok(out)
+
+// The keyword index, rebuilt from the texts rather than stored.
+//
+// It is derived data — a term list, a postings list and a length per
+// document — and storing it would be a second thing to keep in step
+// with the documents.  It is built over EVERY document, marked ones
+// included, because a BM25 position has to equal the label it scores.
+fn keywords_of(docs: [VsDoc], cfg: VsConfig) -> Result<VsKeywordIndex, VsFault> []
+    if not cfg.keyword_index
+        return Ok(vsbm25.empty_index())
+    var texts: [Str] = []
+    list.append(texts, list.map(docs, d => d.text))
+    vsbm25.build(vsbm25.tokenizer(), texts)
+
+// The documents: a count, then each one's four fields, length
+// prefixed.
+fn docs_bytes(c: VsCollection) -> Bytes
+    var parts: [Bytes] = []
+    parts = list.push(parts, bytes.u64_be(list.len(c.docs)))
+    list.append(parts, list.map(c.docs, d => doc_bytes(d)))
+    bytes.concat(parts)
+
+fn doc_bytes(d: VsDoc) -> Bytes
+    let idb = bytes.from_str(d.id)
+    let txb = bytes.from_str(d.text)
+    let mb = bytes.from_str(json.stringify(d.metadata))
+    var parts: [Bytes] = []
+    parts = list.push(parts, bytes.u64_be(bytes.len(idb)))
+    parts = list.push(parts, bytes.clone(idb))
+    parts = list.push(parts, bytes.u64_be(bytes.len(txb)))
+    parts = list.push(parts, bytes.clone(txb))
+    let n = list.len(d.vector)
+    parts = list.push(parts, bytes.u64_be(n))
+    list.append(parts, list.map(list.range(0, n), i => bytes.u64_be(float.to_bits(d.vector[i]))))
+    parts = list.push(parts, bytes.u64_be(bytes.len(mb)))
+    parts = list.push(parts, bytes.clone(mb))
+    bytes.concat(parts)
+
+fn docs_from(var r: Reader, n: Int) -> Result<[VsDoc], VsFault> []
+    if n < 0 or n > 1000000000
+        return Err(VsBadFile("a document count of ${n}"))
+    var out: [VsDoc] = []
+    var i = 0
+    while i < n
+        let d = doc_from(var r)!
+        out = list.push(out, d)
+        i = i + 1
+    Ok(out)
+
+fn doc_from(var r: Reader) -> Result<VsDoc, VsFault> []
+    let id = text_section(var r)!
+    let text = text_section(var r)!
+    let n = r.u64()!
+    if n < 0
+        return Err(VsBadFile("a vector length of ${n}"))
+    var v: [Float] = []
+    var i = 0
+    while i < n
+        v = list.push(v, float.from_bits(r.u64()!))
+        i = i + 1
+    let meta = text_section(var r)!
+    match json.parse(meta)
+        None    => Err(VsBadFile("a document's metadata is not JSON"))
+        Some(h) => Ok(VsDoc { id: id, text: text, metadata: h, vector: v })
+
+fn text_section(var r: Reader) -> Result<Str, VsFault> []
+    let n = r.u64()!
+    let b = r.take(n)!
+    Ok(bytes.to_str(b))
+
+// The fixed prefix, read and checked.
+fn parse_prefix(b: Bytes) -> Result<Prefix, VsFault> []
+    if not is_collection(b)
+        return Err(VsBadFile("it does not begin with ${VS_FILE_MAGIC}"))
+    let ver = bytes.u32_be_at(b, 4) ?? 0 - 1
+    if not list.contains(supported_versions(), ver)
+        return Err(VsBadFile("format version ${ver}"))
+    // A prefix too short for its own integers answers -1, and a
+    // negative length is refused by `section` when it is used.
+    Ok(Prefix { version: ver, total: bytes.u64_be_at(b, 8) ?? 0 - 1,
+                header_len: bytes.u64_be_at(b, 16) ?? 0 - 1,
+                index_len: bytes.u64_be_at(b, 24) ?? 0 - 1,
+                docs_len: bytes.u64_be_at(b, 32) ?? 0 - 1 })
+
+fn section(b: Bytes, off: Int, n: Int, what: Str) -> Result<Bytes, VsFault> []
+    // `n > len - off` rather than `off + n > len`: a length near the
+    // integer ceiling must be refused, not overflow the sum.
+    if off < 0 or n < 0 or off > bytes.len(b) or n > bytes.len(b) - off
+        return Err(VsBadFile("the ${what} section runs past the end"))
+    Ok(bytes.slice(b, off, off + n))
+
+fn parse_json(b: Bytes, what: Str) -> Result<JsonValueH, VsFault> []
+    match json.parse(bytes.to_str(b))
+        None    => Err(VsBadFile("the ${what} is not JSON"))
+        Some(h) => Ok(h)
+
+fn field_str(doc: JsonValueH, key: Str) -> Result<Str, VsFault> []
+    match json.get_str(doc, key)
+        None    => Err(VsBadFile("the header has no ${key}"))
+        Some(s) => Ok(s)
+
+fn field_int(doc: JsonValueH, key: Str) -> Result<Int, VsFault> []
+    match json.get_int(doc, key)
+        None    => Err(VsBadFile("the header has no ${key}"))
+        Some(n) => Ok(n)
+
+fn field_bool(doc: JsonValueH, key: Str) -> Result<Bool, VsFault> []
+    match json.get_bool(doc, key)
+        None    => Err(VsBadFile("the header has no ${key}"))
+        Some(v) => Ok(v)
+
+fn field_float_bits(doc: JsonValueH, key: Str) -> Result<Float, VsFault> []
+    let word = field_int(doc, key)!
+    Ok(float.from_bits(word))
+
+fn index_bytes(ix: HnswIndex) -> Result<Bytes, VsFault> []
+    match hnswio.to_bytes(ix)
+        Ok(b)  => Ok(b)
+        // cov: skip — `hnswio.to_bytes` cannot refuse either: its
+        // `size_bound` answers `Ok` for every index and it writes into a
+        // buffer it sized itself, so nothing reaches this arm.
+        Err(f) => Err(VsIndexFailed(hnswfault_text(f)))
+
+fn index_from(b: Bytes) -> Result<HnswIndex, VsFault> []
+    match hnswio.from_bytes(b)
+        Ok(ix) => Ok(ix)
+        Err(f) => Err(VsIndexFailed(hnswfault_text(f)))
+
+fn hnswfault_text(f: HnswFault) -> Str []
+    f.message()
+
+// A cursor over a section.
+//
+// `at` is the only field that is written, so only it is `var`: a
+// buffer handed in to be read is not a buffer this reader may own.
+struct Reader
+    var at: Int
+    b: Bytes
+
+fn reader(b: Bytes) -> Reader
+    Reader { at: 0, b: b }
+
+impl Reader
+    fn u64(var self) -> Result<Int, VsFault>
+        let found = bytes.u64_be_at(self.b, self.at)
+        match found
+            None    => Err(VsBadFile("a section ends inside an integer"))
+            Some(n) =>
+                self.at = self.at + 8
+                Ok(n)
+
+    fn take(var self, n: Int) -> Result<Bytes, VsFault>
+        if n < 0 or n > bytes.len(self.b) - self.at
+            return Err(VsBadFile("a section ends inside a value"))
+        let out = bytes.slice(self.b, self.at, self.at + n)
+        self.at = self.at + n
+        Ok(out)
+
+// The fixed prefix, as five numbers.
+struct Prefix
+    version: Int
+    total: Int
+    header_len: Int
+    index_len: Int
+    docs_len: Int

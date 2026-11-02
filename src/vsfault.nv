@@ -1,7 +1,5 @@
 // vsfault.nv — why a store call did not answer what was asked for.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.
 //
 // THE FAULTS WORTH HAVING IN A VECTOR STORE ARE THE ONES A CALLER
@@ -80,7 +78,10 @@ pub enum VsFault
 //     // : false
 // ```
 pub fn is_retryable(f: VsFault) -> Bool []
-    todo("vectorstore-nv.vsfault.is_retryable")
+    match f
+        VsTransportFailed(_)         => true
+        VsRemoteFailed(status, _, _) => status >= 500
+        _                            => false
 
 // Whether the fault is in the caller's own request.
 //
@@ -92,15 +93,21 @@ pub fn is_retryable(f: VsFault) -> Bool []
 //     // : true
 // ```
 pub fn is_caller_error(f: VsFault) -> Bool []
-    todo("vectorstore-nv.vsfault.is_caller_error")
+    match f
+        VsDimMismatch(_, _)   => true
+        VsModelMismatch(_, _) => true
+        VsNotFinite(_, _)     => true
+        VsNoSuchDoc(_)        => true
+        VsDuplicateId(_)      => true
+        VsBadFilter(_, _)     => true
+        VsUnsupportedQuery(_) => true
+        _                     => false
 
 // The rule every `VsFault` is printed by: name what was compared, and
 // print both sides.
 //
-// `Result<T, E>` requires `E: Error` (SPEC § 3.4), so this impl is what
-// makes every fallible signature in the package spellable.  It carries
-// a body on an interface release because a panic reporting a fault
-// through a `todo()` would print the wrong sentence.
+// `Result<T, E>` requires `E: Error` (SPEC § 3.4), so this impl is
+// what makes every fallible signature in the package spellable.
 //
 // ```novo ignore
 // use vsfault

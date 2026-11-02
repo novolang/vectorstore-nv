@@ -1,27 +1,80 @@
 // vsio_tests.nv — the two modules that perform anything.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// vectorstore-nv.<module>.<fn>`.
-//
 // THE ONLY FILE IN THE PACKAGE WITH AN EFFECT ROW ON IT, and that is
 // the layer design working: `[fs]` for the six file calls, `[net]` for
 // the three remote ones, and nothing anywhere else.  The paths are
 // under `_novo/`, which the package does not track.
+//
+// EVERY FILE CASE IS BUILT, NOT FOUND.  A collection is written by the
+// package itself and then read back, and a file that is not one is
+// assembled from its stated layout byte by byte — the three sections,
+// the header rewritten with one field changed — so a refusal is
+// pinned against the format's own words rather than against whatever
+// a hand-edited fixture happened to say.
 
 use std.test
+use std.json
+use std.list
+use std.bytes
+use std.fs
+use std.str
 use hnswparam
 use vsdoc
 use vsfault
 use vsfile
 use vshttp
+use vssearch
+use vsstore
 
 fn a_config() -> VsConfig
     vsdoc.config(2, HnswCosine, "test-model",
                  hnswparam.default_params(2, HnswCosine)!)
 
+fn a_keyword_config() -> VsConfig
+    vsdoc.with_keyword_index(a_config())
+
 fn a_path() -> Str
     "_novo/vsio_test.nvvs"
+
+fn a_notes_doc(id: Str, text: Str, x: Float) -> VsDoc
+    vsdoc.with_metadata(vsdoc.doc(id, text, [x, 1.0]),
+                        json.object([("lang", json.string("en"))]))
+
+// Write bytes where `fs.write` cannot: a Str is NUL-terminated, and a
+// file's prefix is not text.
+fn write_bytes(path: Str, b: Bytes) [fs]
+    let opened = fs.open_write(path)
+    let fd = opened ?? 0 - 1
+    let _ = fs.write_at(fd, 0, bytes.to_byte_list(b))
+    fs.close(fd)
+
+// A file assembled from its three sections, with the lengths the
+// format states.  The prefix is written here rather than by the
+// package so a test can hand `from_bytes` a header it chose.
+fn a_file(header: Str, index: Bytes, docs: Bytes) -> Bytes
+    let hb = bytes.from_str(header)
+    let total = 40 + bytes.len(hb) + bytes.len(index) + bytes.len(docs)
+    bytes.concat([bytes.from_str(vsfile.VS_FILE_MAGIC), bytes.u32_be(vsfile.VS_FILE_VERSION),
+                  bytes.u64_be(total), bytes.u64_be(bytes.len(hb)),
+                  bytes.u64_be(bytes.len(index)), bytes.u64_be(bytes.len(docs)),
+                  hb, index, docs])
+
+// The three sections of a real file, so a test can rebuild it with one
+// of them replaced.
+fn header_text_of(b: Bytes) -> Str
+    let hl = bytes.u64_be_at(b, 16)!
+    bytes.to_str(bytes.slice(b, 40, 40 + hl))
+
+fn index_section_of(b: Bytes) -> Bytes
+    let hl = bytes.u64_be_at(b, 16)!
+    let il = bytes.u64_be_at(b, 24)!
+    bytes.slice(b, 40 + hl, 40 + hl + il)
+
+fn docs_section_of(b: Bytes) -> Bytes
+    let hl = bytes.u64_be_at(b, 16)!
+    let il = bytes.u64_be_at(b, 24)!
+    let dl = bytes.u64_be_at(b, 32)!
+    bytes.slice(b, 40 + hl + il, 40 + hl + il + dl)
 
 @test
 fn test_a_collection_goes_to_a_path_and_comes_back() [io, fs]
@@ -57,7 +110,7 @@ fn test_a_header_is_read_without_the_vectors() [io, fs]
 fn test_a_path_is_asked_about_rather_than_loaded_and_caught() [io, fs]
     // A program scanning a directory should not treat "not a
     // collection" as an error.
-    test.assert(vsfile.is_collection_file("_novo/not-a-collection") == false)
+    test.assert(not vsfile.is_collection_file("_novo/not-a-collection"))
 
 @test
 fn test_a_file_backed_store_holds_its_collection_in_memory_until_flushed() [io, fs]
@@ -68,13 +121,13 @@ fn test_a_file_backed_store_holds_its_collection_in_memory_until_flushed() [io, 
         Err(_) => test.assert(false)
         Ok(s)  =>
             test.case("nothing is pending on a fresh open")
-            test.assert(s.dirty == false)
+            test.assert(not s.dirty)
 
             match vsfile.flush(s)
                 Err(_)    => test.assert(false)
                 Ok(wrote) =>
                     test.case("and flushing a clean store writes nothing")
-                    test.assert(wrote == false)
+                    test.assert(not wrote)
 
 @test
 fn test_a_server_that_is_not_there_is_a_fault_and_not_a_panic() [io, net]
@@ -107,3 +160,372 @@ fn test_downloading_a_corpus_is_named_differently_from_a_snapshot() [io, net]
     match vshttp.scroll(c, "", 256)
         Ok(_)  => test.assert(false)
         Err(_) => test.assert(true)
+
+// ── The file format ─────────────────────────────────────────────────
+
+@test
+fn test_every_field_of_every_document_crosses_the_bytes_unchanged() [io, fs]
+    var c = vsdoc.collection("notes", a_keyword_config())
+    match vsdoc.upsert_many(c, [a_notes_doc("a", "denmark", 0.25),
+                                a_notes_doc("b", "sweden", -0.5),
+                                a_notes_doc("c", "norway", 0.75)],
+                                "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+    match vsdoc.delete(c, "b")
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            c = next
+
+    let b = vsfile.to_bytes(c)!
+
+    test.case("the size a caller checks its free space against is the file's own length")
+    test.assert(vsfile.size_bound(c)! == bytes.len(b))
+
+    match vsfile.from_bytes(b)
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.case("the live documents come back, and the marked one is still marked")
+            test.assert(vsdoc.doc_count(back) == 2)
+            test.assert(vsdoc.deleted_count(back) == 1)
+            test.assert(list.len(vsdoc.ids(back)) == 2)
+
+            match vsdoc.get(back, "a")
+                None    => test.assert(false)
+                Some(d) =>
+                    test.case("a vector crosses as its own bits, not as rounded text")
+                    test.assert(list.len(d.vector) == 2)
+                    test.assert(d.vector[0] == 0.25)
+                    test.case("and the metadata is the object that went in")
+                    match json.get_str(d.metadata, "lang")
+                        Some(l) => test.assert(l == "en")
+                        None    => test.assert(false)
+
+            test.case("the keyword index is rebuilt over every document, marked ones included")
+            match vssearch.search(back, vssearch.text_query("denmark", 5))
+                Err(_) => test.assert(false)
+                Ok(o)  =>
+                    test.assert(list.len(o.hits) == 1)
+                    match list.first(o.hits)
+                        None    => test.assert(false)
+                        Some(h) => test.assert(h.id == "a")
+
+@test
+fn test_a_header_answers_what_the_file_holds_without_reading_it() [io, fs]
+    var c = vsdoc.collection("notes", a_keyword_config())
+    match vsdoc.upsert_many(c, [a_notes_doc("a", "denmark", 0.25),
+                                a_notes_doc("b", "sweden", -0.5)],
+                                "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+    match vsdoc.delete(c, "b")
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            c = next
+    let b = vsfile.to_bytes(c)!
+
+    match vsfile.peek_header(b)
+        Err(_) => test.assert(false)
+        Ok(h)  =>
+            test.assert(h.name == "notes")
+            test.assert(h.dim == 2)
+            test.assert(h.model == "test-model")
+            test.assert(h.version == vsfile.VS_FILE_VERSION)
+            test.assert(h.doc_count == 1)
+            test.assert(h.deleted_count == 1)
+            test.assert(h.total_bytes == bytes.len(b))
+
+@test
+fn test_a_store_writes_its_file_only_when_something_changed() [io, fs]
+    let file = "_novo/vsio_store_test.nvvs"
+    let _ = fs.delete(file)
+
+    match vsfile.open(file, "notes", a_keyword_config())
+        Err(_)    => test.assert(false)
+        Ok(store) =>
+            test.case("a path that is not a collection yet opens empty")
+            test.assert(not store.dirty)
+            test.assert(vsdoc.doc_count(vsstore.snapshot(store.memory)) == 0)
+
+            match store.vs_upsert([a_notes_doc("a", "denmark", 0.25)])
+                Err(_) => test.assert(false)
+                Ok(n)  =>
+                    test.case("the document is in memory and the file is now behind")
+                    test.assert(n == 1)
+                    test.assert(store.dirty)
+
+            match store.vs_get(["a"])
+                Err(_) => test.assert(false)
+                Ok(ds) => test.assert(list.len(ds) == 1)
+
+            test.case("and a search reads the store's own index")
+            match store.vs_search(vssearch.query([0.25, 1.0], 5))
+                Err(_) => test.assert(false)
+                Ok(o)  => test.assert(list.len(o.hits) == 1)
+
+            match store.vs_count()
+                Err(_) => test.assert(false)
+                Ok(n)  => test.assert(n == 1)
+
+            test.case("flush writes once and says so")
+            match vsfile.flush(store)
+                Err(_)    => test.assert(false)
+                Ok(wrote) => test.assert(wrote)
+            match vsfile.flush(store)
+                Err(_)    => test.assert(false)
+                Ok(wrote) =>
+                    test.case("and a second flush has nothing to write")
+                    test.assert(not wrote)
+
+            match vsfile.load(file)
+                Err(_)   => test.assert(false)
+                Ok(back) => test.assert(vsdoc.doc_count(back) == 1)
+
+            test.case("a delete marks the store dirty again")
+            match store.vs_delete(["a"])
+                Err(_) => test.assert(false)
+                Ok(n)  => test.assert(n == 1)
+            test.assert(store.dirty)
+
+@test
+fn test_a_path_is_asked_whether_it_is_a_collection_and_short_files_are_not() [io, fs]
+    test.case("four bytes of magic, and nothing shorter")
+    test.assert(not vsfile.is_collection(bytes.from_str("NV")))
+    test.assert(not vsfile.is_collection(bytes.from_str("NVVX")))
+    test.assert(vsfile.is_collection(bytes.from_str("NVVS")))
+
+    test.case("a file too short to hold the magic is not a collection")
+    let tiny = "_novo/vsio_tiny_test"
+    test.assert(fs.write(tiny, "NV"))
+    test.assert(not vsfile.is_collection_file(tiny))
+
+    test.case("an empty file is not one either")
+    let empty = "_novo/vsio_empty_test"
+    test.assert(fs.write(empty, ""))
+    test.assert(not vsfile.is_collection_file(empty))
+
+    test.case("and a file that holds the magic is one")
+    let full = "_novo/vsio_magic_test"
+    test.assert(fs.write(full, "NVVS"))
+    test.assert(vsfile.is_collection_file(full))
+
+@test
+fn test_a_file_too_short_for_its_own_header_says_which_part_is_missing() [io, fs]
+    test.case("a file shorter than the prefix")
+    let short = "_novo/vsio_short_test"
+    test.assert(fs.write(short, "NVVS"))
+    match vsfile.read_header(short)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a prefix that promises a header the file does not hold")
+    let cut = "_novo/vsio_cut_test"
+    let b = vsfile.to_bytes(vsdoc.collection("notes", a_config()))!
+    write_bytes(cut, bytes.slice(b, 0, 40))
+    match vsfile.read_header(cut)
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_save_that_cannot_write_names_the_path_it_could_not_write() [io, fs]
+    let c = vsdoc.collection("notes", a_config())
+
+    test.case("a directory that is not there")
+    match vsfile.save(c, "_novo/no-such-dir/notes.nvvs")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f
+                VsIoFailed(p, _) => test.assert(str.contains(p, "no-such-dir"))
+                _                => test.assert(false)
+
+    test.case("and a rename the filesystem refuses")
+    let dir = "_novo/vsio_dir_test"
+    let _ = fs.delete(dir)
+    test.assert(fs.mkdir(dir))
+    match vsfile.save(c, dir)
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f
+                VsIoFailed(_, _) => test.assert(true)
+                _                => test.assert(false)
+    let _ = fs.delete(dir + ".novo-tmp")
+    let _ = fs.delete(dir)
+
+@test
+fn test_a_path_that_is_not_there_is_a_fault_of_reading_not_of_shape() [io, fs]
+    test.case("load names the path it could not read")
+    match vsfile.load("_novo/vsio-absent.nvvs")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f
+                VsIoFailed(p, _) => test.assert(str.contains(p, "absent"))
+                _                => test.assert(false)
+
+    test.case("and so does read_header")
+    match vsfile.read_header("_novo/vsio-absent.nvvs")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f
+                VsIoFailed(_, _) => test.assert(true)
+                _                => test.assert(false)
+
+// ── Bytes a caller assembled ────────────────────────────────────────
+
+@test
+fn test_a_header_and_an_index_that_disagree_are_refused_before_either_is_believed() [io]
+    let b = vsfile.to_bytes(vsdoc.collection("notes", a_config()))!
+    let rewritten = str.replace(header_text_of(b), "\"dim\":2", "\"dim\":3")
+
+    match vsfile.from_bytes(a_file(rewritten, index_section_of(b), docs_section_of(b)))
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("the refusal names the index rather than reading one dimension of two")
+            test.assert(str.contains(f.message(), "another collection"))
+
+@test
+fn test_a_header_that_is_not_the_one_this_package_writes_is_refused_by_field() [io]
+    let b = vsfile.to_bytes(vsdoc.collection("notes", a_config()))!
+    let h = header_text_of(b)
+    let ix = index_section_of(b)
+    let ds = docs_section_of(b)
+
+    test.case("an unknown metric name")
+    match vsfile.from_bytes(a_file(str.replace(h, "\"cosine\"", "\"cosine-ish\""), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "unknown metric"))
+
+    test.case("an M outside what the index accepts")
+    match vsfile.from_bytes(a_file(str.replace(h, "\"m\":16", "\"m\":0"), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "M"))
+
+    test.case("a level multiplier that is not positive")
+    let negative = json.int(float.to_bits(0.0 - 1.0))
+    match vsfile.from_bytes(a_file(str.replace(h, json.stringify(json.int(float.to_bits(
+                                     hnswparam.default_level_multiplier(16)))),
+                                     json.stringify(negative)),
+                                     ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "level_multiplier"))
+
+    test.case("a header with no deleted list at all")
+    match vsfile.from_bytes(a_file(str.replace(h, ",\"deleted\":[]", ""), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "no deleted list"))
+
+    test.case("a deleted list that is not a list")
+    match vsfile.from_bytes(a_file(str.replace(h, "\"deleted\":[]", "\"deleted\":7"), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "not an array"))
+
+    test.case("an id in the deleted list that is not a string")
+    match vsfile.from_bytes(a_file(str.replace(h, "\"deleted\":[]", "\"deleted\":[7]"), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "not a string"))
+
+    test.case("a header with no keyword_index flag")
+    match vsfile.from_bytes(a_file(str.replace(h, ",\"keyword_index\":false", ""), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "keyword_index"))
+
+    test.case("a header with no model")
+    match vsfile.from_bytes(a_file(str.replace(h, ",\"model\":\"test-model\"", ""), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "model"))
+
+@test
+fn test_a_header_is_asked_for_each_field_by_name_and_a_missing_one_is_named() [io]
+    let b = vsfile.to_bytes(vsdoc.collection("notes", a_config()))!
+    let h = header_text_of(b)
+    let ix = index_section_of(b)
+    let ds = docs_section_of(b)
+
+    test.case("no name")
+    match vsfile.peek_header(a_file(str.replace(h, "\"name\":\"notes\",", ""), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "name"))
+
+    test.case("no document count")
+    match vsfile.peek_header(a_file(str.replace(h, ",\"doc_count\":0", ""), ix, ds))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "doc_count"))
+
+@test
+fn test_a_documents_section_is_read_by_its_own_lengths_and_refuses_when_they_lie() [io]
+    let b = vsfile.to_bytes(vsdoc.collection("notes", a_config()))!
+    let h = header_text_of(b)
+    let ix = index_section_of(b)
+
+    test.case("a document count no file could hold")
+    match vsfile.from_bytes(a_file(h, ix, bytes.u64_be(2000000000)))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "document count"))
+
+    test.case("a section that ends inside its own count")
+    match vsfile.from_bytes(a_file(h, ix, bytes.from_str("abc")))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "inside an integer"))
+
+    test.case("an id that runs past the section")
+    let lying = bytes.concat([bytes.u64_be(1), bytes.u64_be(100), bytes.from_str("a")])
+    match vsfile.from_bytes(a_file(h, ix, lying))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "inside a value"))
+
+    test.case("a vector length that is negative")
+    // A count read as an unsigned 64-bit word is negative when its top
+    // bit is set, and a compiler refuses `${n}` elements without ever
+    // asking how many bytes that would be.
+    let negative = bytes.concat([bytes.u64_be(1),
+                                 bytes.u64_be(1), bytes.from_str("a"),
+                                 bytes.u64_be(1), bytes.from_str("a"),
+                                 bytes.u64_be(0 - 1)])
+    match vsfile.from_bytes(a_file(h, ix, negative))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "vector length"))
+
+    test.case("metadata that is not JSON")
+    let bad_meta = bytes.concat([bytes.u64_be(1),
+                                 bytes.u64_be(1), bytes.from_str("a"),
+                                 bytes.u64_be(1), bytes.from_str("a"),
+                                 bytes.u64_be(0),
+                                 bytes.u64_be(4), bytes.from_str("nope")])
+    match vsfile.from_bytes(a_file(h, ix, bad_meta))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "metadata is not JSON"))
+
+@test
+fn test_the_two_things_that_stand_where_a_file_should_have_a_magic_or_a_version() [io]
+    let b = vsfile.to_bytes(vsdoc.collection("notes", a_config()))!
+
+    test.case("a buffer that does not begin with the magic")
+    match vsfile.from_bytes(bytes.concat([bytes.from_str("NVVX"),
+                                          bytes.slice(b, 4, bytes.len(b))]))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "does not begin"))
+
+    test.case("a format version this package does not read")
+    match vsfile.from_bytes(bytes.concat([bytes.slice(b, 0, 4), bytes.u32_be(99),
+                                          bytes.slice(b, 8, bytes.len(b))]))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "format version"))
+
+    test.case("a prefix that promises a section past the end of the buffer")
+    match vsfile.from_bytes(bytes.slice(b, 0, 40))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "runs past the end"))
+
+    test.case("a header section that is not JSON")
+    match vsfile.from_bytes(a_file("not json at all", index_section_of(b), docs_section_of(b)))
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "is not JSON"))
+
+    test.case("an index section that is not an index")
+    match vsfile.from_bytes(a_file(header_text_of(b), bytes.from_str("junk"),
+                                   docs_section_of(b)))
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("refused in the index's own words rather than as a missing collection")
+            test.assert(str.contains(f.message(), "the index refused"))

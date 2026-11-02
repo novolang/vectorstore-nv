@@ -1,11 +1,6 @@
 // vssearch_tests.nv — the filter and the approximate index, which do
 // not compose the way everybody assumes.
 //
-// RED ON PURPOSE: every body under `src/` is a `todo()`, so every
-// assertion here reaches `not implemented:
-// vectorstore-nv.<module>.<fn>`.  That is the expected result until
-// the bodies land.
-//
 // NO SOCKET AND NO FILE IN THIS FILE.  `vsdoc`, `vsfilter`, `vssearch`
 // and `vsrank` are `core`-shaped inside a `host` package: every row is
 // `[]`, so a whole retrieval pipeline is values here.
@@ -13,7 +8,10 @@
 use std.test
 use std.json
 use std.list
+use std.str
+use hnswgraph
 use hnswparam
+use vsbm25
 use vsdoc
 use vsfault
 use vsfilter
@@ -30,6 +28,25 @@ fn a_doc(id: Str, year: Int, x: Float) -> VsDoc
 
 fn a_collection() -> VsCollection
     vsdoc.collection("notes", a_config())
+
+fn a_text_collection() -> VsCollection
+    vsdoc.collection("notes", vsdoc.with_keyword_index(a_config()))
+
+// A collection whose configuration and whose index disagree about the
+// dimension — two vectors long in the config, three in the graph.  A
+// file with a corrupted header is how this happens in the field; a
+// struct literal is how it is pinned.  Every walk of that index is an
+// `HnswFault`, which is the only way to reach the arms that carry one
+// out as `VsIndexFailed`.
+fn forged_with(docs: [VsDoc]) -> VsCollection
+    VsCollection {
+        name: "forged",
+        config: vsdoc.config(2, HnswCosine, "test-model",
+                             hnswparam.default_params(3, HnswCosine)!),
+        docs: docs,
+        index: hnswgraph.index(hnswparam.default_params(3, HnswCosine)!),
+        keywords: vsbm25.empty_index(),
+        deleted: [] }
 
 @test
 fn test_a_post_filter_answers_fewer_than_k_without_saying_so() [io]
@@ -52,7 +69,7 @@ fn test_a_post_filter_answers_fewer_than_k_without_saying_so() [io]
         Err(_) => test.assert(false)
         Ok(o)  =>
             test.case("the result says it is not the whole truth")
-            test.assert(o.exhaustive == false)
+            test.assert(not o.exhaustive)
 
             test.case("and which plan produced it")
             match o.plan
@@ -214,6 +231,11 @@ fn test_a_search_says_what_it_did() [io]
             test.case("and one line a log can carry")
             test.assert(vssearch.explain(o) != "")
 
+            test.case("which says so when documents may have been missed")
+            let partial = VsSearchOutcome { hits: o.hits, exhaustive: false, plan: o.plan,
+                                            examined: o.examined, filtered_out: o.filtered_out }
+            test.assert(str.contains(vssearch.explain(partial), "may have missed"))
+
 @test
 fn test_a_candidate_width_and_a_k_are_separate_numbers() [io]
     let q = vssearch.with_ef(vssearch.query([0.1, 1.0], 10), 200)
@@ -249,3 +271,302 @@ fn test_a_text_query_is_the_same_value_with_the_other_half_filled_in() [io]
     test.assert(q.text == "capital of Denmark")
     test.assert(list.len(q.vector) == 0)
     test.assert(q.k == 5)
+
+@test
+fn test_an_index_that_refuses_is_a_fault_and_not_an_empty_answer() [io]
+    // A walk of the graph that refuses must not be readable as "nothing
+    // matched": the caller cannot tell those apart, and one of them is a
+    // corrupted file.  Both plans that walk an index carry the reason
+    // out as `VsIndexFailed`.
+    let c = forged_with([])
+    let q = vssearch.query([0.1, 1.0], 2)
+
+    test.case("the post-filter plan")
+    match vssearch.search(c, vssearch.with_plan(q, VsPostFilter(10)))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and the filtered traversal")
+    match vssearch.search(c, vssearch.with_plan(q, VsFilteredTraversal))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_document_of_the_wrong_width_is_a_fault_and_not_a_distance() [io]
+    // The oracle compares vectors with no index in the way, so it is the
+    // one plan whose refusal comes from the comparison itself.
+    let wide = vsdoc.with_vector(vsdoc.doc("wide", "wide", []), [0.1, 0.2, 0.3])
+    let c = forged_with([wide])
+
+    match vssearch.exact_search(c, vssearch.query([0.1, 1.0], 5))
+        Ok(_)    => test.assert(false)
+        Err(why) =>
+            test.case("and the reason names the index, not an empty answer")
+            test.assert(not vsfault.is_retryable(why))
+
+@test
+fn test_a_pre_filter_skips_the_tombstone_and_answers_the_live_document() [io]
+    // A tombstone is a graph element that is still there: hnsw-nv's
+    // level-0 walk goes through it and does not answer it, and every
+    // plan here drops a marked label it meets regardless, so a deleted
+    // document cannot come back through the vector half.
+    var c = a_collection()
+    match vsdoc.upsert_many(c, [a_doc("gone", 2021, 0.1), a_doc("here", 2021, -0.1)],
+                            "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            match vsdoc.delete(u.collection, "gone")
+                Err(_)   => test.assert(false)
+                Ok(next) =>
+                    c = next
+
+    let q = vssearch.with_ef(vssearch.with_plan(vssearch.query([0.1, 1.0], 10),
+                                                VsPostFilter(10)),
+                                                40)
+
+    match vssearch.search(c, q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("the deleted document is not in the answer")
+            test.assert(list.len(o.hits) == 1)
+            match list.first(o.hits)
+                None    => test.assert(false)
+                Some(h) => test.assert(h.id == "here")
+
+@test
+fn test_check_refuses_the_queries_that_would_answer_an_empty_list() [io]
+    let c = a_collection()
+
+    test.case("a k of zero asks for nothing")
+    match vssearch.check(c, vssearch.query([0.1, 1.0], 0))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a query with neither a vector nor text")
+    match vssearch.check(c, vssearch.query([], 5))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("a vector against a collection that holds none")
+    let storeless = vsdoc.collection("none", vsdoc.config(0, HnswCosine, "test-model",
+                                                          hnswparam.default_params(2, HnswCosine)!))
+    match vssearch.check(storeless, vssearch.query([0.1, 1.0], 5))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    test.case("and a vector of the wrong width")
+    match vssearch.check(c, vssearch.query([0.1, 1.0, 2.0], 5))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_a_keyword_search_scores_every_live_document_and_ranks_by_bm25() [io]
+    var c = a_text_collection()
+    match vsdoc.upsert_many(c, [a_doc("denmark", 2021, 0.1), a_doc("sweden", 2019, -0.1)],
+                            "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+
+    let q = vssearch.with_filter(vssearch.text_query("denmark", 10),
+                                 vsfilter.is_clause(VsGt("year", VsInt(2020))))
+
+    match vssearch.search(c, q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("the matching document is picked, in BM25 order")
+            test.assert(list.len(o.hits) == 1)
+            match list.first(o.hits)
+                None    => test.assert(false)
+                Some(h) =>
+                    test.assert(h.id == "denmark")
+                    test.case("its score is a BM25 score and there is no index distance")
+                    test.assert(h.score > 0.0 and h.distance == 0.0)
+
+            test.case("the filter's refusal is counted")
+            test.assert(o.filtered_out == 1)
+
+            test.case("and a scan of the whole corpus is exhaustive")
+            test.assert(o.exhaustive)
+
+@test
+fn test_a_text_query_is_refused_by_name_when_there_is_no_keyword_index() [io]
+    // Refused even though the collection has vectors: answering it as a
+    // vector search would answer a question nobody asked.
+    match vssearch.keyword_outcome(a_collection(), vssearch.text_query("denmark", 10))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+    match vssearch.hybrid_outcome(a_collection(), vssearch.hybrid_query([0.1, 1.0], "denmark", 10))
+        Ok(_)  => test.assert(false)
+        Err(_) => test.assert(true)
+
+@test
+fn test_the_oracle_answers_a_text_query_from_the_keyword_half() [io]
+    var c = a_text_collection()
+    match vsdoc.upsert(c, a_doc("denmark", 2021, 0.1), "test-model")
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            c = next
+
+    match vssearch.exact_search(c, vssearch.text_query("denmark", 10))
+        Err(_)   => test.assert(false)
+        Ok(want) =>
+            test.case("a keyword scan is exact by construction")
+            test.assert(want.exhaustive)
+
+            test.case("and answers the document")
+            test.assert(list.len(want.hits) == 1)
+
+@test
+fn test_recall_against_an_empty_oracle_is_zero_and_not_one() [io]
+    // Nothing to have found is a question that was never asked, not a
+    // perfect answer.
+    let none = VsSearchOutcome { hits: [], exhaustive: true, plan: VsPreFilter,
+                                 examined: 0, filtered_out: 0 }
+    test.assert(vssearch.recall(none, none) == 0.0)
+
+@test
+fn test_a_hybrid_hit_says_which_half_found_it() [io]
+    // A document both retrievers found is a stronger signal than one
+    // either found alone, and the fused score cannot tell them apart.
+    var c = a_text_collection()
+    let rows = [a_doc("denmark", 2021, 1.0),
+                a_doc("sweden", 2021, 0.9),
+                a_doc("norway", 2021, 0.8),
+                vsdoc.doc("denmark twice", "denmark denmark", [-1.0, -1.0])]
+    match vsdoc.upsert_many(c, rows, "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            c = u.collection
+
+    match vssearch.search(c, vssearch.hybrid_query([1.0, 1.0], "denmark", 3))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("the document both halves found is named as such")
+            var both = 0
+            var keywords = 0
+            for h in o.hits
+                match h.source
+                    VsFromBoth(_, _) =>
+                        both = both + 1
+                    VsFromKeyword(_) =>
+                        keywords = keywords + 1
+                    VsFromVector(_)  => ()
+
+            test.assert(both >= 1)
+            test.assert(keywords >= 1)
+
+            test.case("and a document only the keyword half found carries no distance")
+            for h in o.hits
+                match h.source
+                    VsFromKeyword(_) => test.assert(h.distance == 0.0)
+                    _                => ()
+
+@test
+fn test_the_label_guards_answer_an_empty_answer_and_not_a_panic() [io]
+    let c = a_collection()
+
+    test.assert(vssearch.id_at(c, 0) == "")
+    test.assert(vssearch.id_at(c, 0 - 1) == "")
+    test.assert(not vssearch.live_at(c, 0))
+    test.assert(not vssearch.live_at(c, 0 - 1))
+    test.assert(json.type_of(vssearch.meta_at(c, 0)) == "object")
+    test.assert(json.type_of(vssearch.meta_at(c, 0 - 1)) == "object")
+    test.assert(not vssearch.kept_at([], 0))
+    test.assert(vssearch.rank_in([], 0) == 0 - 1)
+
+@test
+fn test_every_plan_has_a_name_and_a_hybrid_source_has_two_ranks() [io]
+    test.assert(vssearch.plan_name(VsAuto) == "auto")
+    test.assert(vssearch.plan_name(VsPostFilter(3)) == "post-filter")
+    test.assert(vssearch.plan_name(VsPreFilter) == "pre-filter")
+    test.assert(vssearch.plan_name(VsFilteredTraversal) == "filtered traversal")
+
+@test
+fn test_an_estimate_asked_for_no_sample_is_zero() [io]
+    var c = a_collection()
+    match vsdoc.upsert(c, a_doc("a", 2021, 0.1), "test-model")
+        Err(_)   => test.assert(false)
+        Ok(next) =>
+            c = next
+
+    test.assert(vssearch.estimate_matches(c, VsAll, 0) == 0)
+    test.assert(vssearch.distance_of_id([], "absent") == 0.0)
+
+// A collection assembled from parts that disagree, which is what a
+// hand-edited or truncated file leaves behind.  The three states below
+// are each one field away from a collection this package would have
+// written, and each one is what a walk of that collection does.
+fn forged_with_deleted(docs: [VsDoc], index: HnswIndex, deleted: [Str]) -> VsCollection
+    VsCollection {
+        name: "forged",
+        config: a_config(),
+        docs: docs,
+        index: index,
+        keywords: vsbm25.empty_index(),
+        deleted: deleted }
+
+@test
+fn test_a_collection_whose_config_disagrees_with_its_index_is_refused_with_the_index_s_words() [io]
+    // The index is what refuses, and its reason crosses as
+    // `VsIndexFailed` rather than being re-declared here: a vector
+    // written into a graph of another dimension is the case a file
+    // with a corrupted header produces.
+    let c = forged_with([a_doc("a", 2021, 0.1)])
+
+    match vsdoc.upsert(c, a_doc("b", 2022, 0.2), "test-model")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("the refusal is the index's")
+            test.assert(str.contains(f.message(), "the index refused"))
+
+@test
+fn test_a_marked_id_the_index_still_returns_is_not_a_hit() [io]
+    // The tombstone, forged: this collection's `deleted` list names a
+    // document the graph was never told about, so the walk hands the
+    // label back and the only thing standing between the caller and a
+    // deleted document is the check in the post-filter.
+    var live = a_collection()
+    match vsdoc.upsert_many(live, [a_doc("a", 2021, 0.1), a_doc("b", 2022, 0.2)], "test-model")
+        Err(_) => test.assert(false)
+        Ok(u)  =>
+            live = u.collection
+
+    let c = forged_with_deleted(live.docs, live.index, ["a"])
+    let q = vssearch.with_plan(
+                vssearch.with_filter(vssearch.query([0.1, 1.0], 10), VsAll),
+                VsPostFilter(10))
+
+    match vssearch.search(c, q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.case("no hit is the marked document")
+            for h in o.hits
+                test.assert(h.id != "a")
+
+@test
+fn test_a_corpus_that_names_one_id_twice_estimates_without_dividing_by_zero() [io]
+    // `doc_count` is `docs - deleted`, so a file whose documents
+    // section repeats an id can hold a live count of one while no
+    // document in it is live.  The estimate is then zero rather than a
+    // division by the number of documents the sample saw.
+    let twice = [a_doc("a", 2021, 0.1), a_doc("a", 2021, 0.1)]
+    let c = forged_with_deleted(twice, hnswgraph.index(a_config().params), ["a"])
+
+    test.assert(vsdoc.doc_count(c) == 1)
+    test.assert(vssearch.estimate_matches(c, VsAll, 10) == 0)
+
+@test
+fn test_a_compact_that_cannot_place_a_document_refuses_rather_than_half_rebuilding() [io]
+    // The rebuild allocates a fresh graph and inserts into it one live
+    // document at a time, so a collection whose documents do not fit
+    // its index parameters stops at the first one instead of leaving a
+    // graph holding half of them.
+    let c = forged_with([a_doc("a", 2021, 0.1), a_doc("b", 2022, 0.2)])
+
+    match vsdoc.compact(c, [0.5, 0.25])
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            test.case("the refusal is the index's own")
+            test.assert(str.contains(f.message(), "the index refused"))

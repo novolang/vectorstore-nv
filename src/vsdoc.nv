@@ -1,7 +1,5 @@
 // vsdoc.nv — a document, and the collection it lives in.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.  A collection is a VALUE: every call takes one and
 // returns one, the same rule hnsw-nv's index follows and for the same
 // reason — a build is then a pure function of its inputs, and two
@@ -29,6 +27,11 @@
 
 use std.json
 use std.list
+use std.math
+use hnswgraph
+use hnswparam
+use vsbm25
+use vsfault
 
 // One document.
 pub struct VsDoc
@@ -59,7 +62,7 @@ pub struct VsDoc
 //     // : a
 // ```
 pub fn doc(id: Str, text: Str, vector: [Float]) -> VsDoc []
-    todo("vectorstore-nv.vsdoc.doc")
+    VsDoc { id: id, text: text, metadata: json.object([]), vector: vector }
 
 // The same document with metadata.
 //
@@ -73,7 +76,7 @@ pub fn doc(id: Str, text: Str, vector: [Float]) -> VsDoc []
 //     // : object
 // ```
 pub fn with_metadata(d: VsDoc, metadata: JsonValueH) -> VsDoc []
-    todo("vectorstore-nv.vsdoc.with_metadata")
+    VsDoc { id: d.id, text: d.text, metadata: metadata, vector: d.vector }
 
 // The same document with a vector.
 //
@@ -85,7 +88,7 @@ pub fn with_metadata(d: VsDoc, metadata: JsonValueH) -> VsDoc []
 //     // : 2
 // ```
 pub fn with_vector(d: VsDoc, vector: [Float]) -> VsDoc []
-    todo("vectorstore-nv.vsdoc.with_vector")
+    VsDoc { id: d.id, text: d.text, metadata: d.metadata, vector: vector }
 
 // How a collection is configured.
 pub struct VsConfig
@@ -107,7 +110,12 @@ pub struct VsConfig
     // the answer to a hybrid search, which is better than a hybrid
     // search that quietly becomes a vector search.
     keyword_index: Bool
-    // hnsw-nv's build parameters.
+    // hnsw-nv's build parameters.  They carry a `metric` of their own,
+    // and nothing here compares it against the `metric` above: an exact
+    // scan ranks by one and the graph walks by the other.
+    // `hnswparam.default_params(dim, metric)` is the way to build the
+    // pair from one metric; a caller who builds the params by hand
+    // should say the same thing twice.
     params: HnswParams
 
 // A configuration for a vector collection.
@@ -120,7 +128,7 @@ pub struct VsConfig
 //     vsdoc.config(768, HnswCosine, "text-embedding-3-small", p)
 // ```
 pub fn config(dim: Int, metric: HnswMetric, model: Str, params: HnswParams) -> VsConfig []
-    todo("vectorstore-nv.vsdoc.config")
+    VsConfig { dim: dim, metric: metric, model: model, keyword_index: false, params: params }
 
 // The same configuration with a keyword index.
 //
@@ -131,7 +139,8 @@ pub fn config(dim: Int, metric: HnswMetric, model: Str, params: HnswParams) -> V
 //     vsdoc.with_keyword_index(c)
 // ```
 pub fn with_keyword_index(c: VsConfig) -> VsConfig []
-    todo("vectorstore-nv.vsdoc.with_keyword_index")
+    VsConfig { dim: c.dim, metric: c.metric, model: c.model, keyword_index: true,
+               params: c.params }
 
 // A collection: the documents, the index over them, and the
 // configuration both were built under.
@@ -172,7 +181,8 @@ pub struct VsKeywordIndex
 //     vsdoc.collection("notes", c)
 // ```
 pub fn collection(name: Str, config: VsConfig) -> VsCollection []
-    todo("vectorstore-nv.vsdoc.collection")
+    VsCollection { name: name, config: config, docs: [], index: hnswgraph.index(config.params),
+                   keywords: vsbm25.empty_index(), deleted: [] }
 
 // Insert or replace one document.
 //
@@ -191,7 +201,76 @@ pub fn collection(name: Str, config: VsConfig) -> VsCollection []
 //         Err(_) => false
 // ```
 pub fn upsert(c: VsCollection, d: VsDoc, model: Str) -> Result<VsCollection, VsFault> []
-    todo("vectorstore-nv.vsdoc.upsert")
+    check_vec(c, d.id, d.vector, model)!
+    let cfg = c.config
+    let spot = position_of(c, d.id)
+    var docs = c.docs[:]
+    var deleted = c.deleted[:]
+    var label = list.len(docs)
+    var held = false
+    match spot
+        Some(at) =>
+            label = at
+            held = true
+        None     => ()
+    let index = match placed_for(c, label, d, held)
+        Err(f) =>
+            return Err(f)
+        Ok(x)  => x
+    if held
+        docs[label] = d
+        if list.contains(deleted, d.id)
+            deleted = without(deleted, d.id)
+    else
+        docs = list.push(docs, d)
+    let next = VsCollection { name: c.name, config: cfg, docs: docs, index: index,
+                              keywords: c.keywords, deleted: deleted }
+    if cfg.keyword_index
+        rebuild_keywords(next, vsbm25.tokenizer())
+    else
+        Ok(next)
+
+// The index an upsert of `d` leaves behind, or the same index when the
+// collection holds no vectors at all.
+fn placed_for(c: VsCollection, label: Int, d: VsDoc, held: Bool) -> Result<HnswIndex, VsFault> []
+    if c.config.dim > 0
+        return place(c.index, label, d.vector, held, uniform_at(label))
+    Ok(c.index)
+
+// The index a write leaves behind, or the fault that stopped it.
+//
+// A function of its own, and `index` a parameter rather than a local
+// `upsert` rewrites in place, because of a leak in the toolchain's RC:
+// a second `x = f(x)!` whose call bears an `Err` does not release the
+// value the first assignment left in `x`, so a collection taken
+// through two of them loses an index per refusal.  Filed as
+// `novo/memory-perceus/a-failing-bang-assignment-leaks-the-value-a-previous-bang-assignment-left-in-the-local`;
+// every caller here binds the answer once instead.
+//
+// The ORDER inside is upsert's: when an id comes back, the labelled
+// slot is unmarked and then taken, and a failure between the two must
+// not leave the collection with neither.
+fn place(index: HnswIndex, label: Int, v: [Float], held: Bool,
+         u: Float) -> Result<HnswIndex, VsFault> []
+    let grown = with_room(index)!
+    if held
+        let marked = indexed(hnswgraph.mark_deleted(grown, label))!
+        indexed(hnswgraph.insert_replacing(marked, label, v, u))
+    else
+        // A new id takes a NEW slot.  `insert_replacing` would take
+        // the first marked slot it found and relabel it, which is a
+        // removed document's slot coming back under a stranger's
+        // name — the one failure this package's id table exists to
+        // make impossible.
+        indexed(hnswgraph.insert(grown, label, v, u))
+
+// A list with one string removed, order kept.
+fn without(xs: [Str], x: Str) -> [Str]
+    var out: [Str] = []
+    for y in xs
+        if y != x
+            out = list.push(out, y)
+    out
 
 // Insert or replace many, in order.
 //
@@ -210,7 +289,21 @@ pub fn upsert(c: VsCollection, d: VsDoc, model: Str) -> Result<VsCollection, VsF
 //         Err(_) => false
 // ```
 pub fn upsert_many(c: VsCollection, ds: [VsDoc], model: Str) -> Result<VsUpsertOutcome, VsFault> []
-    todo("vectorstore-nv.vsdoc.upsert_many")
+    var current = c
+    var added = 0
+    var replaced: [Str] = []
+    for d in ds
+        let was_there = label_of(current, d.id) != None
+        match upsert(current, d, model)
+            Err(f)   =>
+                return Err(f)
+            Ok(next) =>
+                current = next
+                if was_there
+                    replaced = list.push(replaced, d.id)
+                else
+                    added = added + 1
+    Ok(VsUpsertOutcome { collection: current, added: added, replaced: replaced })
 
 // A collection and what an upsert did to it.
 pub struct VsUpsertOutcome
@@ -235,7 +328,16 @@ pub struct VsUpsertOutcome
 //         Err(_) => false
 // ```
 pub fn delete(c: VsCollection, id: Str) -> Result<VsCollection, VsFault> []
-    todo("vectorstore-nv.vsdoc.delete")
+    match label_of(c, id)
+        None        => Err(VsNoSuchDoc(id))
+        Some(label) =>
+            var index = c.index
+            if c.config.dim > 0
+                index = indexed(hnswgraph.mark_deleted(index, label))!
+            var deleted = c.deleted[:]
+            deleted = list.push(deleted, id)
+            Ok(VsCollection { name: c.name, config: c.config, docs: c.docs, index: index,
+                              keywords: c.keywords, deleted: deleted })
 
 // Rebuild the collection with the marked documents actually gone.
 //
@@ -253,7 +355,32 @@ pub fn delete(c: VsCollection, id: Str) -> Result<VsCollection, VsFault> []
 //         Err(_) => false
 // ```
 pub fn compact(c: VsCollection, us: [Float]) -> Result<VsCollection, VsFault> []
-    todo("vectorstore-nv.vsdoc.compact")
+    var docs: [VsDoc] = []
+    var index = hnswgraph.index(c.config.params)
+    for d in c.docs
+        if not list.contains(c.deleted, d.id)
+            let label = list.len(docs)
+            if c.config.dim > 0
+                let placed = place(index, label, d.vector, false, uniform_of(us, label))
+                index = match placed
+                    Err(f) =>
+                        return Err(f)
+                    Ok(x)  => x
+            docs = list.push(docs, d)
+    let next = VsCollection { name: c.name, config: c.config, docs: docs, index: index,
+                              keywords: vsbm25.empty_index(), deleted: [] }
+    if c.config.keyword_index
+        rebuild_keywords(next, vsbm25.tokenizer())
+    else
+        Ok(next)
+
+// The caller's uniform for this document, or the scramble when the
+// list has run out.  A rebuild that named every uniform is the shape
+// hnsw-nv wants; one that names some is still reproducible.
+fn uniform_of(us: [Float], label: Int) -> Float
+    if label < list.len(us)
+        return us[label]
+    uniform_at(label)
 
 // One document by id.
 //
@@ -266,7 +393,11 @@ pub fn compact(c: VsCollection, us: [Float]) -> Result<VsCollection, VsFault> []
 //         None    => false
 // ```
 pub fn get(c: VsCollection, id: Str) -> ?VsDoc []
-    todo("vectorstore-nv.vsdoc.get")
+    match label_of(c, id)
+        None        => None
+        Some(label) =>
+            let d = c.docs[label]
+            Some(d)
 
 // Many documents by id, in the order asked for, skipping the ones that
 // are not there.
@@ -281,7 +412,13 @@ pub fn get(c: VsCollection, id: Str) -> ?VsDoc []
 //     list.len(vsdoc.get_many(c, ids))
 // ```
 pub fn get_many(c: VsCollection, ids: [Str]) -> [VsDoc] []
-    todo("vectorstore-nv.vsdoc.get_many")
+    var out: [VsDoc] = []
+    for id in ids
+        match label_of(c, id)
+            None        => ()
+            Some(label) =>
+                out = list.push(out, c.docs[label])
+    out
 
 // How many live documents the collection holds.
 //
@@ -292,7 +429,7 @@ pub fn get_many(c: VsCollection, ids: [Str]) -> [VsDoc] []
 //     vsdoc.doc_count(c)
 // ```
 pub fn doc_count(c: VsCollection) -> Int []
-    todo("vectorstore-nv.vsdoc.doc_count")
+    list.len(c.docs) - list.len(c.deleted)
 
 // How many marked-deleted documents still occupy space.
 //
@@ -307,7 +444,7 @@ pub fn doc_count(c: VsCollection) -> Int []
 //     vsdoc.deleted_count(c)
 // ```
 pub fn deleted_count(c: VsCollection) -> Int []
-    todo("vectorstore-nv.vsdoc.deleted_count")
+    list.len(c.deleted)
 
 // Every live document's id, in insertion order.
 //
@@ -318,7 +455,11 @@ pub fn deleted_count(c: VsCollection) -> Int []
 //     list.len(vsdoc.ids(c))
 // ```
 pub fn ids(c: VsCollection) -> [Str] []
-    todo("vectorstore-nv.vsdoc.ids")
+    var out: [Str] = []
+    for d in c.docs
+        if not list.contains(c.deleted, d.id)
+            out = list.push(out, d.id)
+    out
 
 // Whether a vector may be inserted into this collection.
 //
@@ -334,4 +475,90 @@ pub fn ids(c: VsCollection) -> [Str] []
 //         Err(_) => false
 // ```
 pub fn check_vector(c: VsCollection, v: [Float], model: Str) -> Result<Int, VsFault> []
-    todo("vectorstore-nv.vsdoc.check_vector")
+    check_vec(c, "", v, model)
+
+// The same three checks with the document's id, so a non-finite
+// coordinate names the document it came from.
+fn check_vec(c: VsCollection, id: Str, v: [Float], model: Str) -> Result<Int, VsFault> []
+    let cfg = c.config
+    if model != "" and model != cfg.model
+        return Err(VsModelMismatch(cfg.model, model))
+    if list.len(v) != cfg.dim
+        return Err(VsDimMismatch(cfg.dim, list.len(v)))
+    var at = 0
+    for x in v
+        if math.is_nan(x) or math.is_inf(x)
+            return Err(VsNotFinite(id, at))
+        at = at + 1
+    Ok(cfg.dim)
+
+// The slot an id occupies, live or marked.
+//
+// **THIS TABLE IS THE PACKAGE'S ONLY MAPPING FROM A USER ID TO THE
+// INTEGER hnsw-nv indexes by.**  A collection's `docs` list is the
+// table: a document's position in it IS its label, appending is what
+// assigns a label, and nothing else may.  `compact` is the one call
+// that renumbers, and it rebuilds the list and the index together so
+// the two cannot drift.
+fn position_of(c: VsCollection, id: Str) -> ?Int
+    var at = 0
+    for d in c.docs
+        if d.id == id
+            return Some(at)
+        at = at + 1
+    None
+
+// The slot a live document occupies, or `None` when it is marked.
+fn label_of(c: VsCollection, id: Str) -> ?Int
+    if list.contains(c.deleted, id)
+        return None
+    position_of(c, id)
+
+// The uniform an insert at this label draws.
+//
+// A written-down scramble rather than a generator: the same collection
+// built twice must produce the same graph, and a package that carried
+// a random number generator would have to carry its seed too.  The
+// value is in (0, 1) exclusive, which is what `hnswgraph.insert`
+// requires.
+fn uniform_at(label: Int) -> Float
+    let h = (label * 1103515245 + 12345) % 65536
+    (h as Float + 0.5) / 65536.0
+
+// hnsw-nv's own reason, as this package's fault.
+//
+// `!` does not convert between error types, so every hnsw-nv call in
+// this module goes through here.  `VsIndexFailed` carries the reason
+// as text rather than re-declaring `HnswFault`'s variants, which would
+// be a second original that goes stale.
+fn indexed(r: Result<HnswIndex, HnswFault>) -> Result<HnswIndex, VsFault> []
+    match r
+        Ok(ix) => Ok(ix)
+        Err(f) => Err(VsIndexFailed(hnswfault_text(f)))
+
+// An index with room for one more element.
+fn with_room(index: HnswIndex) -> Result<HnswIndex, VsFault> []
+    let have = hnswgraph.count(index)
+    if have < index.params.capacity
+        return Ok(index)
+    indexed(hnswgraph.grow(index, index.params.capacity * 2))
+
+// hnsw-nv's own reason, as text.  `HnswFault` is that package's type
+// and re-declaring its variants here would be a second original that
+// goes stale.
+fn hnswfault_text(f: HnswFault) -> Str
+    f.message()
+
+// The keyword index rebuilt over every document, marked ones included.
+//
+// Every document, because the BM25 positions are the SAME integers the
+// index labels are, and a rebuild that skipped the marked ones would
+// slide every later document onto its neighbour's score.
+fn rebuild_keywords(c: VsCollection, t: VsTokenizer) -> Result<VsCollection, VsFault> []
+    var texts: [Str] = []
+    list.append(texts, list.map(c.docs, d => d.text))
+    // `vsbm25.build` cannot refuse: it folds `add` over the corpus and
+    // `add` answers `Ok` for every text, so the `!` never returns early.
+    let ix = vsbm25.build(t, texts)!
+    Ok(VsCollection { name: c.name, config: c.config, docs: c.docs,
+                      index: c.index, keywords: ix, deleted: c.deleted })

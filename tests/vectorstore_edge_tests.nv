@@ -1,0 +1,837 @@
+// vectorstore_edge_tests.nv — the four ways a vector store corrupts an
+// answer while every verdict stays green.
+//
+// The oracle suites assert that the parts work.  These assert the
+// specific failures that a passing suite does not see:
+//
+//   1. THE ID MAPPING.  hnsw-nv indexes by an integer label and a
+//      caller asks by id, so one table stands between them.  A stale
+//      entry answers a document under a name that is not the one its
+//      vector belongs to, and nothing about the answer looks wrong.
+//      The case that shows it up is a delete followed by a re-add,
+//      which is when a label is freed and reused.
+//   2. RECALL.  An approximate index that finds four of ten true
+//      neighbours answers a shape identical to one that finds ten.
+//      Measured here against a brute-force scan of the same vectors,
+//      because that is the only ground truth there is — and the number
+//      is printed, so a reader of a run can see what it was.
+//   3. THE METRIC.  Cosine, dot and Euclidean rank the same three
+//      vectors three different ways.  A collection answering by the
+//      wrong one returns documents that are not neighbours, with a
+//      number beside each that looks fine.
+//   4. THE TOMBSTONE.  A delete in an HNSW graph is a mark, so a
+//      search that forgets to read it returns a document the caller
+//      removed.  Pinned on every query shape, before and after the
+//      compaction that reclaims the slot.
+//   5. THE HALF-WRITTEN FILE.  `vsfile.save` writes a temporary name
+//      and renames over the target, so a write that fails partway must
+//      leave the collection that was already there.  A save that wrote
+//      in place answers a load with half a collection, or with none.
+//
+// `[]` throughout, but for the two tests that need the world: the file
+// one writes under `_novo/` and the failed write is a device that
+// refuses every write.
+
+use std.test
+use std.json
+use std.list
+use std.bytes
+use std.fs
+use std.str
+use hnswparam
+use vsdoc
+use vsfault
+use vsfile
+use vsfilter
+use vssearch
+use vshttp
+
+fn a_config() -> VsConfig
+    vsdoc.config(2, HnswCosine, "test-model", hnswparam.default_params(2, HnswCosine)!)
+
+fn a_keyword_config() -> VsConfig
+    vsdoc.with_keyword_index(a_config())
+
+fn a_doc(id: Str, x: Float, y: Float) -> VsDoc
+    vsdoc.doc(id, "", [x, y])
+
+fn a_text_doc(id: Str, text: Str, x: Float, y: Float) -> VsDoc
+    vsdoc.doc(id, text, [x, y])
+
+fn put(c: VsCollection, d: VsDoc) -> VsCollection
+    vsdoc.upsert(c, d, "test-model")!
+
+// Whether any hit carries this id.
+fn answered_with(hits: [VsHit], id: Str) -> Bool
+    list.any(hits, h => h.id == id)
+
+// Whether the store holds no document by this id.
+fn missing(c: VsCollection, id: Str) -> Bool
+    match vsdoc.get(c, id)
+        None    => true
+        Some(_) => false
+
+fn first_id(o: VsSearchOutcome) -> Str
+    match list.first(o.hits)
+        None    => "none"
+        Some(h) => h.id
+
+// ── 1. The table between a label and an id ───────────────────────────
+
+@test
+fn test_a_delete_then_a_re_add_answers_the_new_document_by_name() [io]
+    // THE FAILURE THIS TABLE EXISTS TO MAKE IMPOSSIBLE.  hnsw-nv
+    // indexes by position; the answer has to be a user id.  Deleting
+    // frees a label, and a store that lets the next insert reclaim it
+    // — or that keeps a stale label-to-id entry — answers the document
+    // that was removed under the name of the one that replaced it.
+    var c = vsdoc.collection("ids", a_config())
+    c = put(c, a_doc("alpha", 1.0, 0.0))
+    c = put(c, a_doc("beta", 0.0, 1.0))
+    c = put(c, a_doc("gamma", 0.5, 0.5))
+
+    c = vsdoc.delete(c, "beta")!
+
+    test.case("the deleted id is gone from the table")
+    test.assert(missing(c, "beta"))
+    test.assert(not list.contains(vsdoc.ids(c), "beta"))
+    test.assert(vsdoc.doc_count(c) == 2)
+
+    test.case("a new document takes its own slot, not the freed one")
+    c = put(c, a_doc("delta", 0.0, 1.0))
+
+    test.case("and a query for that vector answers delta")
+    match vssearch.search(c, vssearch.query([0.0, 1.0], 1))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "delta")
+
+    test.case("the same question through the path that maps labels back")
+    // The index is the only path that answers a label, so a stale
+    // entry can only appear here.  Both plans that read the graph are
+    // asked.
+    match vssearch.search(c, vssearch.with_plan(vssearch.query([0.0, 1.0], 1),
+                                               VsFilteredTraversal))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "delta")
+
+    match vssearch.search(c, vssearch.with_plan(vssearch.query([0.0, 1.0], 1),
+                                               VsPostFilter(4)))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "delta")
+
+    test.case("and no query anywhere answers the removed name")
+    match vssearch.search(c, vssearch.query([0.0, 1.0], 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(not answered_with(o.hits, "beta"))
+
+@test
+fn test_a_re_added_id_comes_back_its_own_document() [io]
+    // The other half of the same mapping: the id is not reserved by
+    // the delete.  An upsert of it is a fresh document with a fresh
+    // vector, and a stale entry that still says "deleted" would answer
+    // nothing.
+    var c = vsdoc.collection("ids", a_config())
+    c = put(c, a_doc("beta", 0.0, 1.0))
+    c = vsdoc.delete(c, "beta")!
+
+    test.assert(vsdoc.deleted_count(c) == 1)
+
+    c = put(c, a_doc("beta", 1.0, 0.0))
+
+    test.case("the id is live again")
+    test.assert(not missing(c, "beta"))
+    test.assert(vsdoc.deleted_count(c) == 0)
+    test.assert(vsdoc.doc_count(c) == 1)
+
+    test.case("with the vector it was re-added under")
+    match vssearch.search(c, vssearch.query([1.0, 0.0], 1))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "beta")
+
+    test.case("and the vector it had before answers it too — only it is there")
+    match vssearch.search(c, vssearch.query([0.0, 1.0], 1))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "beta")
+
+@test
+fn test_a_stranger_in_a_freed_slot_does_not_take_the_removed_id_with_it() [io]
+    // The freed label is not the next insert's to take.  A store that
+    // lets an unrelated insert reclaim it leaves the removed id with no
+    // label in the index at all, and the re-add — an upsert, the only
+    // way a caller has to say "it is back" — then has nothing to mark
+    // and fails, with every verdict it has already given still green.
+    // Both halves are asserted: the stranger answers as itself, and the
+    // removed id comes back whole.
+    var c = vsdoc.collection("ids", a_config())
+    c = put(c, a_doc("alpha", 1.0, 0.0))
+    c = put(c, a_doc("beta", 0.0, 1.0))
+    c = vsdoc.delete(c, "beta")!
+
+    test.case("an unrelated document arrives while the label is free")
+    c = put(c, a_doc("delta", 0.5, 0.5))
+    test.assert(vsdoc.doc_count(c) == 2)
+
+    test.case("and the removed id can still come back under its own name")
+    match vsdoc.upsert(c, a_doc("beta", 0.0, 1.0), "test-model")
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert(vsdoc.doc_count(back) == 3)
+            test.assert(vsdoc.deleted_count(back) == 0)
+            match vsdoc.get(back, "beta")
+                None    => test.assert(false)
+                Some(d) => test.assert(d.id == "beta")
+            match vssearch.search(back, vssearch.query([0.0, 1.0], 1))
+                Err(_) => test.assert(false)
+                Ok(o)  => test.assert(first_id(o) == "beta")
+            test.case("and the stranger is answered as itself")
+            match vssearch.search(back, vssearch.query([0.5, 0.5], 1))
+                Err(_) => test.assert(false)
+                Ok(o)  => test.assert(first_id(o) == "delta")
+
+// ── 4. The tombstone ─────────────────────────────────────────────────
+
+@test
+fn test_a_deleted_document_is_returned_by_no_query() [io]
+    // A mark, not a removal: the vector is still in the graph, and
+    // every path that reads the graph has to read the mark as well.
+    var c = vsdoc.collection("tomb", a_keyword_config())
+    c = put(c, a_text_doc("a", "the capital of Denmark", 1.0, 0.0))
+    c = put(c, a_text_doc("b", "the capital of Sweden", 0.9, 0.1))
+
+    c = vsdoc.delete(c, "a")!
+
+    test.case("the vector search does not answer it")
+    match vssearch.search(c, vssearch.query([1.0, 0.0], 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(not answered_with(o.hits, "a"))
+
+    test.case("nor the keyword search")
+    match vssearch.search(c, vssearch.text_query("denmark", 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(not answered_with(o.hits, "a"))
+
+    test.case("nor the hybrid one, which runs both")
+    match vssearch.search(c, vssearch.hybrid_query([1.0, 0.0], "denmark", 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(not answered_with(o.hits, "a"))
+
+    test.case("nor the exact scan")
+    match vssearch.exact_search(c, vssearch.query([1.0, 0.0], 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(not answered_with(o.hits, "a"))
+
+    test.case("and the compaction that reclaims the slot does not revive it")
+    // The mark is the only thing standing between the graph and the
+    // removed vector, so compacting without dropping the slot is a
+    // resurrection.
+    let tight = vsdoc.compact(c, [])!
+
+    test.assert(vsdoc.deleted_count(c) == 1)
+    test.assert(vsdoc.deleted_count(tight) == 0)
+    test.assert(vsdoc.doc_count(tight) == 1)
+
+    match vssearch.search(tight, vssearch.query([1.0, 0.0], 10))
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.assert(not answered_with(o.hits, "a"))
+            test.assert(first_id(o) == "b")
+
+    match vssearch.search(tight, vssearch.hybrid_query([1.0, 0.0], "denmark", 10))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(not answered_with(o.hits, "a"))
+
+// ── 3. The metric ────────────────────────────────────────────────────
+
+// The three documents the three metrics disagree about.
+//
+// q is `[1, 0]`.  A is closest by Euclid, B by cosine and C by inner
+// product — three different answers to one question, which is the
+// whole reason a collection records the metric it was built with.
+fn metric_collection(metric: HnswMetric) -> VsCollection
+    var c = vsdoc.collection("metric",
+                             vsdoc.config(2, metric, "test-model",
+                                          hnswparam.default_params(2, metric)!))
+    c = put(c, a_doc("A", 1.0, 0.5))
+    c = put(c, a_doc("B", 2.0, 0.0))
+    c = put(c, a_doc("C", 5.0, 5.0))
+    c
+
+@test
+fn test_cosine_dot_and_euclidean_answer_different_documents() [io]
+    // One query, three collections, three metrics, three answers.
+    // q = [1, 0]:
+    //
+    //   cosine      A 0.894, B 1.000, C 0.707  -> B
+    //   euclidean   A 0.500, B 1.000, C 6.403  -> A
+    //   inner       A 1.000, B 2.000, C 5.000  -> C
+    let q = vssearch.query([1.0, 0.0], 1)
+
+    match vssearch.search(metric_collection(HnswCosine), q)
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "B")
+
+    match vssearch.search(metric_collection(HnswL2), q)
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "A")
+
+    match vssearch.search(metric_collection(HnswInner), q)
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(first_id(o) == "C")
+
+@test
+fn test_the_index_carries_the_metric_it_was_built_with() [io]
+    // The config's metric is what the exact paths compare by; the
+    // params' metric is what the graph compares by.  A graph walk and
+    // an exact scan over one collection have to be ranking by the same
+    // rule, and both spellings are checked here so that a change to
+    // either is visible.
+    let cos = metric_collection(HnswCosine)
+    let l2 = metric_collection(HnswL2)
+
+    test.assert(cos.config.metric == HnswCosine)
+    test.assert(cos.config.params.metric == HnswCosine)
+    test.assert(l2.config.metric == HnswL2)
+    test.assert(l2.config.params.metric == HnswL2)
+
+    test.case("the graph walk agrees with the exact scan on one metric")
+    let q = vssearch.query([1.0, 0.0], 3)
+    let plan = vssearch.with_plan(q, VsFilteredTraversal)
+
+    match vssearch.search(cos, plan)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            match vssearch.exact_search(cos, q)
+                Err(_)   => test.assert(false)
+                Ok(want) =>
+                    test.assert(vssearch.recall(o, want) == 1.0)
+
+// ── 2. Recall, measured ──────────────────────────────────────────────
+
+// A deterministic generator, so the number this suite prints is the
+// same number on every run and on every machine.
+fn lcg(seed: Int) -> Int
+    (seed * 1103515245 + 12345) % 2147483647
+
+fn a_vector(seed: Int, dim: Int) -> [Float]
+    var out: [Float] = []
+    var s = seed
+    var i = 0
+    while i < dim
+        s = lcg(s)
+        out = list.push(out, (s % 2000) as Float / 1000.0 - 1.0)
+        i = i + 1
+    out
+
+fn a_corpus(n: Int, dim: Int) -> VsCollection
+    var c = vsdoc.collection("corpus",
+                             vsdoc.config(dim, HnswCosine, "test-model",
+                                          hnswparam.default_params(dim, HnswCosine)!))
+    var i = 0
+    var seed = 11
+    while i < n
+        seed = lcg(seed)
+        c = put(c, vsdoc.doc("d${str.from_int(i)}", "", a_vector(seed, dim)))
+        i = i + 1
+    c
+
+@test
+fn test_recall_is_measured_against_a_brute_force_scan() [io]
+    // Recall is a claim about a corpus, not a property of an
+    // algorithm, so it is measured here rather than asserted: the same
+    // vectors, the same query encoding, one approximate answer and one
+    // exact one.  The number is printed and the floor below is what
+    // the measurement is allowed to fall to.
+    let c = a_corpus(1200, 16)
+
+    test.assert(vsdoc.doc_count(c) == 1200)
+
+    var total = 0.0
+    var queries = 0
+    var seed = 90001
+    while queries < 20
+        seed = lcg(seed)
+        let qv = a_vector(seed, 16)
+
+        // The graph walk, named rather than left to `VsAuto` — this is
+        // the approximate path, and the only one recall is about.
+        let approx = vssearch.search(c, vssearch.with_plan(vssearch.query(qv, 10),
+                                                          VsFilteredTraversal))!
+        let exact = vssearch.exact_search(c, vssearch.query(qv, 10))!
+
+        total = total + vssearch.recall(approx, exact)
+        queries = queries + 1
+
+    let measured = total / queries as Float
+
+    test.case("the oracle is exhaustive and the walk is not")
+    let oracle = vssearch.exact_search(c, vssearch.query(a_vector(7, 16), 1))!
+    test.assert(oracle.exhaustive)
+
+    test.case("the exact scan answers itself perfectly")
+    let one = vssearch.query(a_vector(4242, 16), 10)
+    let first = vssearch.exact_search(c, one)!
+    let second = vssearch.exact_search(c, one)!
+    test.assert(vssearch.recall(first, second) == 1.0)
+
+    println("measured recall: ${measured} over ${queries} queries, k=10, 1200 vectors of 16 dimensions")
+
+    test.case("and the measured recall is above the floor this suite sets")
+    test.assert(measured >= 0.8)
+
+// ── The filter, in three spellings ───────────────────────────────────
+//
+// README rule 14: `vsfilter.matches` is what a filter means, and each
+// server translation is tested against it.  The readers below are
+// qdrant's and chroma's own semantics, written from their documentation
+// rather than from this package, so that a change to an encoding is
+// caught as a change of MEANING and not merely a change of shape.
+//
+// The three places they do not agree are all about what a document does
+// not have — a field that is absent, a value of another type, an empty
+// `in` — and they are named in the README and in `vshttp`'s header.
+// Every document this section reads carries every field its filters
+// name.
+
+// A document with the fields these filters name.
+fn a_meta(year: Int, tag: Str, tags: [Str]) -> JsonValueH
+    var xs: [Any] = []
+    list.append(xs, list.map(tags, t => json.string(t)))
+    json.object([("year", json.int(year)), ("tag", json.string(tag)),
+                 ("tags", json.array(xs))])
+
+// Whether the document has the field, as qdrant's `is_empty` means it:
+// absent, null and `[]` are one state.
+fn json_has(meta: JsonValueH, f: Str) -> Bool
+    match json.query(meta, f)
+        None    => false
+        Some(v) =>
+            if json.is_null(v)
+                false
+            else
+                match json.to_list(v)
+                    Some(xs) => list.len(xs) > 0
+                    None     => true
+
+// The field as a number, or None when it is absent or not one.
+fn number_at(meta: JsonValueH, f: Str) -> ?Float
+    match json.query(meta, f)
+        None    => None
+        Some(v) => json.to_float(v)
+
+// The field's text, or None.
+fn text_at(meta: JsonValueH, f: Str) -> ?Str
+    match json.query(meta, f)
+        None    => None
+        Some(v) => json.to_str(v)
+
+// A bound in a range object, as a number whether it was written as an
+// integer or a float.
+fn bound_at(ops: JsonValueH, key: Str) -> ?Float
+    match json.get(ops, key)
+        None    => None
+        Some(v) => json.to_float(v)
+
+// The four ordering operators, whichever one the object carries.
+// `prefix` is what each dialect puts in front of them: qdrant's range
+// object has `lt`, chroma's has `$lt`.
+fn bounded(ops: JsonValueH, meta: JsonValueH, f: Str, prefix: Str) -> Bool
+    match number_at(meta, f)
+        None       => false
+        Some(have) =>
+            match bound_at(ops, "${prefix}lt")
+                Some(w) => have < w
+                None    =>
+                    match bound_at(ops, "${prefix}lte")
+                        Some(w) => have <= w
+                        None    =>
+                            match bound_at(ops, "${prefix}gt")
+                                Some(w) => have > w
+                                None    =>
+                                    match bound_at(ops, "${prefix}gte")
+                                        Some(w) => have >= w
+                                        None    => false
+
+// ── qdrant's own semantics ───────────────────────────────────────────
+
+// Whether qdrant answers true for this document, given the filter
+// `encode_filter` produced.
+fn qdrant_answers(enc: JsonValueH, meta: JsonValueH) -> Bool
+    match json.get_list(enc, "must")
+        Some(xs) => qdrant_all(xs, meta)
+        None     =>
+            match json.get_list(enc, "should")
+                Some(ys) => qdrant_any(ys, meta)
+                None     =>
+                    match json.get_list(enc, "must_not")
+                        Some(zs) => not qdrant_any(zs, meta)
+                        None     => qdrant_condition(enc, meta)
+
+fn qdrant_all(xs: [JsonValueH], meta: JsonValueH) -> Bool
+    for x in xs
+        if not qdrant_answers(x, meta)
+            return false
+    true
+
+fn qdrant_any(xs: [JsonValueH], meta: JsonValueH) -> Bool
+    for x in xs
+        if qdrant_answers(x, meta)
+            return true
+    false
+
+// One condition: an `is_empty`, a `range` or a `match`.
+fn qdrant_condition(enc: JsonValueH, meta: JsonValueH) -> Bool
+    match json.get(enc, "is_empty")
+        Some(inner) =>
+            match json.get_str(inner, "key")
+                None    => false
+                Some(f) => not json_has(meta, f)
+        None        =>
+            match json.get_str(enc, "key")
+                // An empty object: qdrant's filter that matches
+                // everything.
+                None    => true
+                Some(f) =>
+                    match json.get(enc, "range")
+                        Some(r) => bounded(r, meta, f, "")
+                        None    => qdrant_matched(enc, meta, f)
+
+fn qdrant_matched(enc: JsonValueH, meta: JsonValueH, f: Str) -> Bool
+    match json.get(enc, "match")
+        None    => false
+        Some(m) =>
+            match json.get(m, "value")
+                Some(w) => qdrant_holds(meta, f, w)
+                None    =>
+                    match json.get(m, "any")
+                        Some(ws) => qdrant_holds_any(meta, f, ws)
+                        None     =>
+                            match json.get_str(m, "prefix")
+                                Some(t) =>
+                                    match text_at(meta, f)
+                                        None    => false
+                                        Some(s) => str.starts_with(s, t)
+                                None    => false
+
+// One value: equal to the field's, or a member of the field's array —
+// which is how qdrant's `match` reads a list-valued payload field.
+fn qdrant_holds(meta: JsonValueH, f: Str, want: JsonValueH) -> Bool
+    match json.query(meta, f)
+        None    => false
+        Some(v) =>
+            if json.equals(v, want)
+                true
+            else
+                match json.to_list(v)
+                    None     => false
+                    Some(xs) => list.any(xs, x => json.equals(x, want))
+
+fn qdrant_holds_any(meta: JsonValueH, f: Str, wants: JsonValueH) -> Bool
+    match json.to_list(wants)
+        None     => false
+        Some(ws) => list.any(ws, w => qdrant_holds(meta, f, w))
+
+// ── chroma's own semantics ───────────────────────────────────────────
+
+// Whether chroma answers true for this document, given the `where`
+// `encode_filter` produced.
+fn chroma_answers(enc: JsonValueH, meta: JsonValueH) -> Bool
+    match json.get_list(enc, "\$and")
+        Some(xs) => chroma_all(xs, meta)
+        None     =>
+            match json.get_list(enc, "\$or")
+                Some(ys) => chroma_any(ys, meta)
+                None     => chroma_condition(enc, meta)
+
+fn chroma_all(xs: [JsonValueH], meta: JsonValueH) -> Bool
+    for x in xs
+        if not chroma_answers(x, meta)
+            return false
+    true
+
+fn chroma_any(xs: [JsonValueH], meta: JsonValueH) -> Bool
+    for x in xs
+        if chroma_answers(x, meta)
+            return true
+    false
+
+// One `{field: {"$op": value}}`.
+fn chroma_condition(enc: JsonValueH, meta: JsonValueH) -> Bool
+    match list.first(json.keys(enc))
+        // An empty object: chroma's `where` that matches everything.
+        None    => true
+        Some(f) =>
+            match json.get(enc, f)
+                None      => false
+                Some(ops) =>
+                    match json.get(ops, "\$eq")
+                        Some(w) => chroma_eq(meta, f, w)
+                        None    =>
+                            match json.get(ops, "\$ne")
+                                Some(w) => not chroma_eq(meta, f, w)
+                                None    =>
+                                    match json.get(ops, "\$in")
+                                        Some(ws) => chroma_listed(meta, f, ws)
+                                        None     =>
+                                            match json.get(ops, "\$nin")
+                                                Some(ws) => not chroma_listed(meta, f, ws)
+                                                None     =>
+                                                    match json.get(ops, "\$contains")
+                                                        Some(w) => chroma_holds(meta, f, w)
+                                                        None    =>
+                                                            match json.get(ops, "\$not_contains")
+                                                                Some(w) => not chroma_holds(meta, f, w)
+                                                                None    => bounded(ops, meta, f, "\$")
+
+// A field equal to a value.  A field the document does not have is
+// false for every operator but the negated ones, which is where the
+// README says the servers part company with `vsfilter.matches`.
+fn chroma_eq(meta: JsonValueH, f: Str, want: JsonValueH) -> Bool
+    match json.query(meta, f)
+        None    => false
+        Some(v) => json.equals(v, want)
+
+// Whether the field's value is one of the listed ones.
+fn chroma_listed(meta: JsonValueH, f: Str, wants: JsonValueH) -> Bool
+    match json.to_list(wants)
+        None     => false
+        Some(ws) =>
+            match json.query(meta, f)
+                None    => false
+                Some(v) => list.any(ws, w => json.equals(v, w))
+
+// Whether the field's array holds the value.
+fn chroma_holds(meta: JsonValueH, f: Str, want: JsonValueH) -> Bool
+    match json.query(meta, f)
+        None    => false
+        Some(v) =>
+            match json.to_list(v)
+                None     => false
+                Some(xs) => list.any(xs, x => json.equals(x, want))
+
+// The filters both dialects carry, over documents that carry every
+// field they name.
+fn a_filter_set() -> [VsFilter]
+    [VsAll,
+     VsNone,
+     vsfilter.is_clause(VsEq("tag", VsStr("alpha"))),
+     vsfilter.is_clause(VsNe("tag", VsStr("alpha"))),
+     vsfilter.is_clause(VsLt("year", VsInt(2020))),
+     vsfilter.is_clause(VsLte("year", VsInt(2020))),
+     vsfilter.is_clause(VsGt("year", VsInt(2020))),
+     vsfilter.is_clause(VsGte("year", VsInt(2020))),
+     vsfilter.is_clause(VsIn("tag", [VsStr("alpha"), VsStr("beta")])),
+     vsfilter.is_clause(VsContains("tags", VsStr("x"))),
+     vsfilter.all_of([vsfilter.is_clause(VsGt("year", VsInt(2020))),
+                      vsfilter.is_clause(VsEq("tag", VsStr("alpha")))]),
+     vsfilter.any_of([vsfilter.is_clause(VsEq("tag", VsStr("alpha"))),
+                      vsfilter.is_clause(VsEq("tag", VsStr("beta")))]),
+     VsNot(VsEq("tag", VsStr("alpha")))]
+
+@test
+fn test_both_dialects_ask_the_question_vsfilter_answers() [io]
+    // One filter, one document, three answers: the local evaluator and
+    // the two translations.  A translation that swapped `$gt` for
+    // `$lt`, put the impossible condition of `VsNone` where it does not
+    // exclude, or answered `$eq` for `$ne` is still a JSON object of
+    // the right shape; it fails here.
+    let docs = [a_meta(2021, "alpha", ["x", "y"]),
+                a_meta(2019, "gamma", ["y"])]
+
+    var checked = 0
+    for f in a_filter_set()
+        for meta in docs
+            test.assert(qdrant_answers(vshttp.encode_filter(VsQdrant, f)!, meta)
+                        == vsfilter.matches(f, meta)!)
+            test.assert(chroma_answers(vshttp.encode_filter(VsChroma, f)!, meta)
+                        == vsfilter.matches(f, meta)!)
+            checked = checked + 1
+
+    test.case("every filter met every document through both translations")
+    test.assert(checked == 26)
+
+@test
+fn test_chroma_refuses_the_three_clauses_it_has_no_operator_for() [io]
+    // Rule 10's exception, and the reason it is written down rather
+    // than designed away: the compiler accepts `VsPrefix`, `VsExists`
+    // and `VsMissing`, and chroma's `where` has no operator for any of
+    // them.  The refusal names the clause, so a caller that gets one
+    // knows which half of a filter to rewrite.
+    let meta = a_meta(2021, "alpha", ["x"])
+
+    let hard = [vsfilter.is_clause(VsPrefix("tag", "al")),
+                vsfilter.is_clause(VsExists("year")),
+                vsfilter.is_clause(VsMissing("year"))]
+
+    var refused = 0
+    for f in hard
+        test.assert(qdrant_answers(vshttp.encode_filter(VsQdrant, f)!, meta)
+                    == vsfilter.matches(f, meta)!)
+
+        match vshttp.encode_filter(VsChroma, f)
+            Ok(_)  => test.assert(false)
+            Err(e) =>
+                match e
+                    VsUnsupportedQuery(why) =>
+                        test.assert(str.len(why) > 0)
+                        refused = refused + 1
+                    _                       => test.assert(false)
+
+    test.case("qdrant carries all three, and chroma refuses all three by name")
+    test.assert(refused == 3)
+
+@test
+fn test_a_filtered_search_says_it_is_not_exhaustive_and_a_scan_says_it_is() [io]
+    // The one field that separates "three documents match" from "three
+    // of the ten I looked at match".  A filtered traversal may not have
+    // seen the matches a selective filter cut off from the entry point,
+    // and it is the plan `VsAuto` picks for a broad filter.
+    let c = a_corpus(1200, 16)
+    let f = vsfilter.is_clause(VsGt("year", VsInt(2020)))
+    let q = vssearch.with_filter(vssearch.query(a_vector(31, 16), 10), f)
+
+    match vssearch.search(c, vssearch.with_plan(q, VsFilteredTraversal))
+        Err(_) => test.assert(false)
+        Ok(o)  => test.assert(not o.exhaustive)
+
+    match vssearch.exact_search(c, q)
+        Err(_) => test.assert(false)
+        Ok(o)  =>
+            test.assert(o.exhaustive)
+            test.assert(list.len(o.hits) == 0)
+
+// ── the collection whose documents carry no vectors ─────────────────
+
+@test
+fn test_a_keyword_only_collection_takes_documents_with_no_vector() [io]
+    // `VsConfig.dim` is zero for a keyword-only collection, and the
+    // index is then never touched: a document goes in with an empty
+    // vector, which is the same write a collection WITH vectors
+    // refuses.  A store that indexed the empty vector anyway would put
+    // every document of such a collection at the same point and answer
+    // every vector query with all of them.
+    //
+    // The parameters are hnsw-nv's and `default_params` refuses a
+    // dimension below 1, so this is also the one configuration where
+    // the config's dimension and the parameters' dimension are meant to
+    // differ — a collection that holds text and no vectors at all.
+    let cfg = vsdoc.with_keyword_index(
+        vsdoc.config(0, HnswCosine, "test-model",
+                     hnswparam.default_params(2, HnswCosine)!))
+    let c = vsdoc.collection("notes", cfg)
+
+    let c1 = vsdoc.upsert(c, vsdoc.doc("a", "denmark sweden", []), "test-model")!
+    let c2 = vsdoc.upsert(c1, vsdoc.doc("b", "sweden norway", []), "test-model")!
+
+    test.case("both documents are there, in the order they were written")
+    test.assert_eq(vsdoc.doc_count(c2), 2)
+    test.assert_eq(list.len(vsdoc.get_many(c2, ["a", "b"])), 2)
+
+    test.case("and the keyword index was rebuilt over both of them")
+    test.assert(list.len(c2.keywords.doc_len) == 2)
+    test.assert(c2.keywords.total_len > 0)
+
+    test.case("while the vector that a collection with a dimension would want is refused")
+    let with_vectors = vsdoc.collection("notes", a_config())
+    match vsdoc.upsert(with_vectors, vsdoc.doc("a", "denmark", []), "test-model")
+        Ok(_)  => test.assert(false)
+        Err(f) =>
+            match f
+                VsDimMismatch(_, _) => test.assert(true)
+                _                   => test.assert(false)
+
+// ── the write that stops in the middle ──────────────────────────────
+
+@test
+fn test_a_write_that_fails_leaves_the_collection_that_was_already_there() [fs]
+    // `save` writes a temporary name and renames over the target, and
+    // this is the case the rename is for: a write that fails partway
+    // through.  A store that wrote the target in place would answer a
+    // load with half a collection — or with none, which looks the same
+    // as a collection that was never there.
+    //
+    // The failure is arranged rather than hoped for: `/dev/full` is the
+    // device whose every write answers ENOSPC, and a symlink at the
+    // temporary name is what puts it where `save` writes the bytes.
+    test.case("a good collection first")
+    let _ = fs.mkdir("_novo")
+    let target = "_novo/vsedge_full.nvvs"
+    let tmp = target + ".novo-tmp"
+    let _ = fs.delete(tmp)
+    let _ = fs.delete(target)
+    let c = put(vsdoc.collection("notes", a_config()),
+                a_text_doc("a", "denmark", 1.0, 2.0))
+    match vsfile.save(c, target)
+        Err(_) => test.assert(false)
+        Ok(n)  => test.assert(n > 0)
+
+    test.case("then a write that cannot happen, under the temporary name")
+    test.assert(fs.symlink("/dev/full", tmp))
+    match vsfile.save(c, target)
+        Ok(_)  => test.assert(false)
+        Err(f) => test.assert(str.contains(f.message(), "vsedge_full"))
+
+    test.case("and the collection that was there before is still whole")
+    match vsfile.load(target)
+        Err(_)   => test.assert(false)
+        Ok(back) =>
+            test.assert_eq(vsdoc.doc_count(back), 1)
+            match vsdoc.get(back, "a")
+                Some(d) => test.assert(d.id == "a")
+                None    => test.assert(false)
+
+    test.case("the temporary name is still the thing that failed, and the target is not it")
+    test.assert(fs.exists(tmp))
+
+    let _ = fs.delete(tmp)
+    let _ = fs.delete(target)
+
+// A file made of the 40-byte prefix alone, stating the three section
+// lengths a hostile writer chose.
+fn a_prefix(header_len: Int, index_len: Int, docs_len: Int) -> Bytes
+    bytes.concat([bytes.from_str(vsfile.VS_FILE_MAGIC), bytes.u32_be(vsfile.VS_FILE_VERSION),
+                  bytes.u64_be(40), bytes.u64_be(header_len),
+                  bytes.u64_be(index_len), bytes.u64_be(docs_len)])
+
+fn refused_as_bad_file(b: Bytes) -> Bool
+    match vsfile.from_bytes(b)
+        Err(VsBadFile(_)) => true
+        Err(_)            => false
+        Ok(_)             => false
+
+@test
+fn test_a_header_length_near_the_integer_ceiling_is_a_bad_file_not_a_panic() [io]
+    test.assert(refused_as_bad_file(a_prefix(9223372036854775800, 0, 0)))
+
+@test
+fn test_an_index_length_near_the_integer_ceiling_is_a_bad_file_not_a_panic() [io]
+    let hb = bytes.from_str("{}")
+    let b = bytes.concat([bytes.from_str(vsfile.VS_FILE_MAGIC), bytes.u32_be(vsfile.VS_FILE_VERSION),
+                          bytes.u64_be(42), bytes.u64_be(2),
+                          bytes.u64_be(9223372036854775800), bytes.u64_be(0), hb])
+    test.assert(refused_as_bad_file(b))
+
+@test
+fn test_a_value_length_near_the_integer_ceiling_inside_the_documents_is_a_bad_file() [io]
+    // A real collection with one document, then its id length rewritten.
+    let c = put(vsdoc.collection("n", a_config()), a_doc("a", 0.5, 0.5))
+    let b = vsfile.to_bytes(c)!
+    let hl = bytes.u64_be_at(b, 16) ?? 0
+    let il = bytes.u64_be_at(b, 24) ?? 0
+    let docs_at = 40 + hl + il
+    // The document count is the first u64 of the section, and the first
+    // value's length follows it.
+    let damaged = bytes.concat([bytes.slice(b, 0, docs_at + 8), bytes.u64_be(9223372036854775800),
+                                bytes.slice(b, docs_at + 16, bytes.len(b))])
+    test.assert(refused_as_bad_file(damaged))
+
+@test
+fn test_a_header_read_from_disk_refuses_a_length_near_the_integer_ceiling() [io, fs]
+    let path = "_novo/vs_edge_huge_header.nvvs"
+    let opened = fs.open_write(path)
+    let fd = opened ?? 0 - 1
+    let _ = fs.write_at(fd, 0, bytes.to_byte_list(a_prefix(9223372036854775800, 0, 0)))
+    fs.close(fd)
+    match vsfile.read_header(path)
+        Err(VsBadFile(_)) => test.assert(true)
+        Err(_)            => test.assert(true)
+        Ok(_)             => test.fail("a header of that length was believed")

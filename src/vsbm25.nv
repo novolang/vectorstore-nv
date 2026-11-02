@@ -1,7 +1,5 @@
 // vsbm25.nv — the keyword half: Okapi BM25 over unicode-nv's tokens.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.  An index is a value and scoring is arithmetic.
 //
 // WHY A KEYWORD INDEX IS IN A VECTOR STORE AT ALL.  An embedding is a
@@ -26,7 +24,17 @@
 // correction for long documents, off by default and named so that
 // turning it on is a decision somebody made.
 
+// `vsdoc` is named below without a `use` line: it imports this module,
+// and the pair is refused as a cycle
+// (language/a-package-module-resolves-a-sibling-s-name-that-it-cannot-import).
 use std.list
+use std.math
+use std.str
+use ucase
+use udata
+use ugrapheme
+use vsfault
+use vsdoc
 
 // BM25's parameters.
 pub struct VsBm25Params
@@ -53,7 +61,7 @@ pub struct VsBm25Params
 //     // : 1.2
 // ```
 pub fn default_params() -> VsBm25Params []
-    todo("vectorstore-nv.vsbm25.default_params")
+    VsBm25Params { k1: 1.2, b: 0.75, delta: 0.0 }
 
 // Parameters of the caller's own.
 //
@@ -65,7 +73,7 @@ pub fn default_params() -> VsBm25Params []
 //     // : 1.5
 // ```
 pub fn params(k1: Float, b: Float, delta: Float) -> VsBm25Params []
-    todo("vectorstore-nv.vsbm25.params")
+    VsBm25Params { k1: k1, b: b, delta: delta }
 
 // How text becomes terms.
 pub struct VsTokenizer
@@ -93,7 +101,7 @@ pub struct VsTokenizer
 //     // : true
 // ```
 pub fn tokenizer() -> VsTokenizer []
-    todo("vectorstore-nv.vsbm25.tokenizer")
+    VsTokenizer { fold_case: true, min_length: 1, stop_words: [] }
 
 // The same tokeniser with a stop-word list.
 //
@@ -105,7 +113,7 @@ pub fn tokenizer() -> VsTokenizer []
 //     // : 1
 // ```
 pub fn with_stop_words(t: VsTokenizer, words: [Str]) -> VsTokenizer []
-    todo("vectorstore-nv.vsbm25.with_stop_words")
+    VsTokenizer { fold_case: t.fold_case, min_length: t.min_length, stop_words: words }
 
 // Split text into terms.
 //
@@ -120,7 +128,49 @@ pub fn with_stop_words(t: VsTokenizer, words: [Str]) -> VsTokenizer []
 //     list.len(vsbm25.tokenize(t, text))
 // ```
 pub fn tokenize(t: VsTokenizer, text: Str) -> [Str] []
-    todo("vectorstore-nv.vsbm25.tokenize")
+    var folded = text
+    if t.fold_case
+        folded = ucase.fold(udata.data_full(), text)
+    var out: [Str] = []
+    for w in ugrapheme.words(folded)
+        if is_word(w.kind)
+            let term = str.slice(folded, w.start, w.end)
+            if kept(t, term)
+                out = list.push(out, term)
+    out
+
+// Whether a UAX #29 word segment is a term: the words and the
+// numbers, never the spaces or the punctuation between them.
+fn is_word(k: UniWordKind) -> Bool
+    match k
+        WordLetters => true
+        WordNumeric => true
+        _           => false
+
+// Whether a term survives the tokeniser's two other rules.
+fn kept(t: VsTokenizer, term: Str) -> Bool
+    if str.is_empty(term)
+        return false
+    if ugrapheme.count(term) < t.min_length
+        return false
+    not list.contains(t.stop_words, term)
+
+// The first index of a term, or `None`.
+fn term_at(terms: [Str], term: Str) -> ?Int
+    var at = 0
+    for t in terms
+        if t == term
+            return Some(at)
+        at = at + 1
+    None
+
+// A term list with the repeats dropped, order kept.
+fn distinct(xs: [Str]) -> [Str]
+    var out: [Str] = []
+    for x in xs
+        if not list.contains(out, x)
+            out = list.push(out, x)
+    out
 
 // Build an index over a corpus.
 //
@@ -136,7 +186,10 @@ pub fn tokenize(t: VsTokenizer, text: Str) -> [Str] []
 //         Err(_) => false
 // ```
 pub fn build(t: VsTokenizer, texts: [Str]) -> Result<VsKeywordIndex, VsFault> []
-    todo("vectorstore-nv.vsbm25.build")
+    var ix = empty_index()
+    for text in texts
+        ix = add(ix, t, text)!
+    Ok(ix)
 
 // An empty index.
 //
@@ -148,7 +201,7 @@ pub fn build(t: VsTokenizer, texts: [Str]) -> Result<VsKeywordIndex, VsFault> []
 //     // : 0
 // ```
 pub fn empty_index() -> VsKeywordIndex []
-    todo("vectorstore-nv.vsbm25.empty_index")
+    VsKeywordIndex { terms: [], doc_freq: [], postings: [], doc_len: [], total_len: 0 }
 
 // Add one document to an index.
 //
@@ -161,7 +214,32 @@ pub fn empty_index() -> VsKeywordIndex []
 //         Err(_) => false
 // ```
 pub fn add(ix: VsKeywordIndex, t: VsTokenizer, text: Str) -> Result<VsKeywordIndex, VsFault> []
-    todo("vectorstore-nv.vsbm25.add")
+    let toks = tokenize(t, text)
+    // The position this document takes, which is the caller's own
+    // order and the only thing a score is ever looked up by.
+    let at = list.len(ix.doc_len)
+    var terms = ix.terms[:]
+    var df = ix.doc_freq[:]
+    var postings = ix.postings[:]
+    var doc_len = ix.doc_len[:]
+    var counted: [Str] = []
+    for term in toks
+        let already = list.contains(counted, term)
+        if not already
+            counted = list.push(counted, term)
+        match term_at(terms, term)
+            None    =>
+                terms = list.push(terms, term)
+                postings = list.push(postings, [at])
+                df = list.push(df, 1)
+            Some(i) =>
+                postings[i] = list.push(postings[i], at)
+                if not already
+                    df[i] = df[i] + 1
+    doc_len = list.push(doc_len, list.len(toks))
+    Ok(VsKeywordIndex { terms: terms, doc_freq: df, postings: postings,
+                        doc_len: doc_len,
+                        total_len: ix.total_len + list.len(toks) })
 
 // Score every document against a query.
 //
@@ -176,7 +254,32 @@ pub fn add(ix: VsKeywordIndex, t: VsTokenizer, text: Str) -> Result<VsKeywordInd
 //     list.len(vsbm25.score_all(ix, t, p, q))
 // ```
 pub fn score_all(ix: VsKeywordIndex, t: VsTokenizer, p: VsBm25Params, query: Str) -> [Float] []
-    todo("vectorstore-nv.vsbm25.score_all")
+    let toks = distinct(tokenize(t, query))
+    list.map(list.range(0, list.len(ix.doc_len)), at => score_doc(ix, p, toks, at))
+
+// One document's BM25 score against the query's distinct terms.
+//
+// The sum is over the QUERY's terms, which is why a term the corpus
+// has never seen contributes nothing rather than a full idf.
+fn score_doc(ix: VsKeywordIndex, p: VsBm25Params, toks: [Str], at: Int) -> Float
+    let avg = average_length(ix)
+    let dl = ix.doc_len[at] as Float
+    var total = 0.0
+    for term in toks
+        if doc_frequency(ix, term) > 0
+            let tf = tf_of(ix, term, at) as Float
+            if tf > 0.0
+                // A document that holds a term is not empty, so the average
+                // length is above zero here.
+                let norm = 1.0 - p.b + p.b * dl / avg
+                total = total + idf(ix, term) * (tf * (p.k1 + 1.0) / (tf + p.k1 * norm) + p.delta)
+    total
+
+// How many times a term occurs in one document.
+fn tf_of(ix: VsKeywordIndex, term: Str, at: Int) -> Int
+    match term_at(ix.terms, term)
+        Some(i) => list.count(ix.postings[i], x => x == at)
+        None    => 0
 
 // The top k documents by score, as index positions.
 //
@@ -188,7 +291,15 @@ pub fn score_all(ix: VsKeywordIndex, t: VsTokenizer, p: VsBm25Params, query: Str
 // ```
 pub fn top_k(ix: VsKeywordIndex, t: VsTokenizer, p: VsBm25Params, query: Str,
              k: Int) -> [VsTermHit] []
-    todo("vectorstore-nv.vsbm25.top_k")
+    let scores = score_all(ix, t, p, query)
+    var keyed: [(Float, Int)] = []
+    var at = 0
+    for s in scores
+        if s > 0.0
+            keyed = list.push(keyed, (0.0 - s, at))
+        at = at + 1
+    keyed = list.sort(keyed)
+    list.map(list.take(keyed, k), pair => VsTermHit { at: pair.1, score: 0.0 - pair.0 })
 
 // One keyword hit.
 pub struct VsTermHit
@@ -210,7 +321,9 @@ pub struct VsTermHit
 //     vsbm25.idf(ix, term)
 // ```
 pub fn idf(ix: VsKeywordIndex, term: Str) -> Float []
-    todo("vectorstore-nv.vsbm25.idf")
+    let n = list.len(ix.doc_len) as Float
+    let df = doc_frequency(ix, term) as Float
+    math.log(1.0 + (n - df + 0.5) / (df + 0.5))
 
 // How many documents contain a term.
 //
@@ -221,7 +334,9 @@ pub fn idf(ix: VsKeywordIndex, term: Str) -> Float []
 //     vsbm25.doc_frequency(ix, term)
 // ```
 pub fn doc_frequency(ix: VsKeywordIndex, term: Str) -> Int []
-    todo("vectorstore-nv.vsbm25.doc_frequency")
+    match term_at(ix.terms, term)
+        Some(i) => ix.doc_freq[i]
+        None    => 0
 
 // The average document length the index was built over.
 //
@@ -236,7 +351,10 @@ pub fn doc_frequency(ix: VsKeywordIndex, term: Str) -> Int []
 //     vsbm25.average_length(ix)
 // ```
 pub fn average_length(ix: VsKeywordIndex) -> Float []
-    todo("vectorstore-nv.vsbm25.average_length")
+    let n = list.len(ix.doc_len)
+    if n == 0
+        return 0.0
+    ix.total_len as Float / n as Float
 
 // Which of a query's terms the index has never seen.
 //
@@ -252,7 +370,11 @@ pub fn average_length(ix: VsKeywordIndex) -> Float []
 //     list.len(vsbm25.unknown_terms(ix, t, q))
 // ```
 pub fn unknown_terms(ix: VsKeywordIndex, t: VsTokenizer, query: Str) -> [Str] []
-    todo("vectorstore-nv.vsbm25.unknown_terms")
+    var out: [Str] = []
+    for term in distinct(tokenize(t, query))
+        if doc_frequency(ix, term) == 0
+            out = list.push(out, term)
+    out
 
 // How many distinct terms the index holds.
 //
@@ -263,4 +385,4 @@ pub fn unknown_terms(ix: VsKeywordIndex, t: VsTokenizer, query: Str) -> [Str] []
 //     vsbm25.term_count(ix)
 // ```
 pub fn term_count(ix: VsKeywordIndex) -> Int []
-    todo("vectorstore-nv.vsbm25.term_count")
+    list.len(ix.terms)

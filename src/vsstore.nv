@@ -1,8 +1,6 @@
 // vsstore.nv — the trait a local collection and a remote server both
 // sit behind.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `VsStore[e]` IS THE TRAIT THAT CROSSES THE LAYER.  A collection in
 // memory performs nothing; a file performs `[fs]`; a qdrant or chroma
 // server performs `[net]`.  Behind one trait they are the same four
@@ -33,6 +31,15 @@
 //   loss of information, not a bug, and it is stated where a caller
 //   reads it rather than assumed away.
 
+use std.json
+use std.list
+use vsbm25
+use vsdoc
+use vsfault
+use vsfilter
+use vsrank
+use vssearch
+
 // A document store.
 //
 // `e` is the effect row the implementation supplies: nothing at all
@@ -60,8 +67,18 @@ pub trait VsStore[e]
 // The in-memory store is where a program starts and where its tests
 // stay: it performs nothing, so a whole retrieval pipeline is testable
 // with no server and no file.
+// **THE COLLECTION IS THE ONE `var` FIELD**, and it is the trait that
+// forces it.  A store's four calls answer counts rather than a new
+// store — a remote one cannot answer a value — so an upsert has to
+// land somewhere the caller's own binding can see.  A `let`-bound
+// store cannot be written through a `var self` method (E2036 refuses
+// the call), and it does not need one: a struct is a reference type,
+// and a free function taking `var m: VsMemory` writes through a name
+// the caller's `let` shares.  So every mutating method here is
+// `self` by value, exactly as published, delegating to a `var`
+// helper below.
 pub struct VsMemory
-    collection: VsCollection
+    var collection: VsCollection
     tokenizer: VsTokenizer
     bm25: VsBm25Params
     fusion: VsFusion
@@ -75,7 +92,8 @@ pub struct VsMemory
 //     vsstore.memory(c)
 // ```
 pub fn memory(c: VsCollection) -> VsMemory []
-    todo("vectorstore-nv.vsstore.memory")
+    VsMemory { collection: c, tokenizer: vsbm25.tokenizer(), bm25: vsbm25.default_params(),
+               fusion: vsrank.default_fusion() }
 
 // The same store with a tokeniser of the caller's own.
 //
@@ -86,7 +104,7 @@ pub fn memory(c: VsCollection) -> VsMemory []
 //     vsstore.with_tokenizer(m, t)
 // ```
 pub fn with_tokenizer(m: VsMemory, t: VsTokenizer) -> VsMemory []
-    todo("vectorstore-nv.vsstore.with_tokenizer")
+    VsMemory { collection: m.collection, tokenizer: t, bm25: m.bm25, fusion: m.fusion }
 
 // The same store with BM25 parameters of the caller's own.
 //
@@ -97,7 +115,7 @@ pub fn with_tokenizer(m: VsMemory, t: VsTokenizer) -> VsMemory []
 //     vsstore.with_bm25(m, p)
 // ```
 pub fn with_bm25(m: VsMemory, p: VsBm25Params) -> VsMemory []
-    todo("vectorstore-nv.vsstore.with_bm25")
+    VsMemory { collection: m.collection, tokenizer: m.tokenizer, bm25: p, fusion: m.fusion }
 
 // The same store with a fusion of the caller's own.
 //
@@ -108,7 +126,7 @@ pub fn with_bm25(m: VsMemory, p: VsBm25Params) -> VsMemory []
 //     vsstore.with_fusion(m, f)
 // ```
 pub fn with_fusion(m: VsMemory, f: VsFusion) -> VsMemory []
-    todo("vectorstore-nv.vsstore.with_fusion")
+    VsMemory { collection: m.collection, tokenizer: m.tokenizer, bm25: m.bm25, fusion: f }
 
 // The collection inside, as a value.
 //
@@ -125,7 +143,7 @@ pub fn with_fusion(m: VsMemory, f: VsFusion) -> VsMemory []
 //     vsstore.snapshot(m)
 // ```
 pub fn snapshot(m: VsMemory) -> VsCollection []
-    todo("vectorstore-nv.vsstore.snapshot")
+    m.collection
 
 // The in-memory store performs nothing.
 //
@@ -141,19 +159,185 @@ pub fn snapshot(m: VsMemory) -> VsCollection []
 // ```
 impl VsStore[] for VsMemory
     fn vs_upsert(self, docs: [VsDoc]) -> Result<Int, VsFault>
-        todo("vectorstore-nv.vsstore.VsMemory.vs_upsert")
+        var shared = self
+        memory_upsert(var shared, docs)
 
     fn vs_delete(self, ids: [Str]) -> Result<Int, VsFault>
-        todo("vectorstore-nv.vsstore.VsMemory.vs_delete")
+        var shared = self
+        memory_delete(var shared, ids)
 
     fn vs_get(self, ids: [Str]) -> Result<[VsDoc], VsFault>
-        todo("vectorstore-nv.vsstore.VsMemory.vs_get")
+        Ok(vsdoc.get_many(self.collection, ids))
 
     fn vs_search(self, q: VsQuery) -> Result<VsSearchOutcome, VsFault>
-        todo("vectorstore-nv.vsstore.VsMemory.vs_search")
+        memory_search(self, q)
 
     fn vs_count(self) -> Result<Int, VsFault>
-        todo("vectorstore-nv.vsstore.VsMemory.vs_count")
+        // `-1` is the trait's "cannot say without a scan".  A
+        // collection in memory can always say, and says it.
+        Ok(vsdoc.doc_count(self.collection))
+
+// Insert or replace, through a `var` name the caller's `let` shares.
+//
+// The model is the collection's own: a `VsDoc` carries no model, and
+// the store's contract is that every vector handed to it came from
+// the model the collection records.  A caller holding vectors from
+// somewhere else has `vssearch.with_model` to say so, and `vsdoc`
+// still refuses a vector of the wrong dimension or a NaN coordinate.
+fn memory_upsert(var m: VsMemory, docs: [VsDoc]) -> Result<Int, VsFault> []
+    let c = m.collection
+    let u = vsdoc.upsert_many(c, docs, c.config.model)!
+    m.collection = reindexed(u.collection, m.tokenizer)!
+    Ok(u.added + list.len(u.replaced))
+
+// Remove by id, counting only the ids that were there.
+//
+// An absent id is not a fault here: a delete of ten ids where three
+// were already gone is a delete of seven, and refusing the whole call
+// over the other three is not what a caller asked for.
+fn memory_delete(var m: VsMemory, ids: [Str]) -> Result<Int, VsFault> []
+    var current = m.collection
+    var gone = 0
+    for id in ids
+        match vsdoc.delete(current, id)
+            Err(_)   => ()
+            Ok(next) =>
+                current = next
+                gone = gone + 1
+    m.collection = current
+    Ok(gone)
+
+// Rebuild the keyword index with THIS store's tokeniser.
+//
+// `vsdoc`'s own calls index with `vsbm25.tokenizer()`, which is right
+// for a collection nobody tuned.  A store that was given a tokeniser
+// of its own is the one place that decision is visible, so the store
+// is where the rebuild happens — and it happens over EVERY document,
+// marked ones included, because a BM25 position has to equal the
+// label it scores or the keyword half answers the wrong document.
+fn reindexed(c: VsCollection, t: VsTokenizer) -> Result<VsCollection, VsFault> []
+    if not c.config.keyword_index
+        return Ok(c)
+    var texts: [Str] = []
+    list.append(texts, list.map(c.docs, d => d.text))
+    let ix = vsbm25.build(t, texts)!
+    Ok(VsCollection { name: c.name, config: c.config, docs: c.docs, index: c.index,
+                      keywords: ix, deleted: c.deleted })
+
+// The store's search.
+//
+// The vector half is `vssearch.search` unchanged.  The keyword and
+// hybrid halves are not: the store is where a caller's own tokeniser,
+// BM25 parameters and fusion live, and `vssearch.search` runs a
+// collection value with the defaults.  A store that carried three
+// tuned parameters and ignored them would be a store whose fields are
+// decoration.
+fn memory_search(m: VsMemory, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    let has_vector = list.len(q.vector) > 0
+    if q.text == ""
+        vssearch.search(m.collection, q)
+    elif has_vector
+        memory_hybrid(m, q)
+    else
+        memory_keyword(m, q)
+
+fn memory_keyword(m: VsMemory, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    let c = m.collection
+    if not c.config.keyword_index
+        return Err(VsUnsupportedQuery("a text search: this collection has no keyword index"))
+    let scores = vsbm25.score_all(c.keywords, m.tokenizer, m.bm25, q.text)
+    var picked: [Int] = []
+    var vals: [Float] = []
+    var examined = 0
+    var rejected = 0
+    var at = 0
+    for s in scores
+        if at < list.len(c.docs)
+            if live_label(c, at)
+                examined = examined + 1
+                if vsfilter.matches(q.filter, meta_label(c, at))!
+                    if s > 0.0
+                        picked = list.push(picked, at)
+                        vals = list.push(vals, s)
+                else
+                    rejected = rejected + 1
+        at = at + 1
+    // Exact over every live document, so this arm can promise what an
+    // approximate walk cannot.
+    Ok(VsSearchOutcome { hits: ranked(c, picked, vals, q.k), exhaustive: true,
+                         plan: VsPreFilter, examined: examined, filtered_out: rejected })
+
+fn memory_hybrid(m: VsMemory, q: VsQuery) -> Result<VsSearchOutcome, VsFault> []
+    let vq = VsQuery { vector: q.vector, text: "", k: q.k, filter: q.filter, plan: q.plan,
+                       ef: q.ef, model: q.model }
+    let tq = VsQuery { vector: [], text: q.text, k: q.k, filter: q.filter, plan: q.plan,
+                       ef: q.ef, model: q.model }
+    let vout = vssearch.search(m.collection, vq)!
+    let kout = memory_keyword(m, tq)!
+    let merged = vsrank.fuse(m.fusion, [vsrank.of_hits(vout.hits), vsrank.of_hits(kout.hits)])
+    var hits: [VsHit] = []
+    for h in list.take(merged, q.k)
+        hits = list.push(hits, VsHit { id: h.id, score: h.score,
+                                       distance: distance_for(vout.hits, h.id),
+                                       source: source_for(h.ranks) })
+    Ok(VsSearchOutcome { hits: hits, exhaustive: vout.exhaustive and kout.exhaustive,
+                         plan: vout.plan, examined: vout.examined + kout.examined,
+                         filtered_out: vout.filtered_out + kout.filtered_out })
+
+// The keyword hits, best first.  `score` is BM25 itself — higher is
+// nearer, without being a similarity on a cosine's scale, which is
+// exactly why the fusion above merges ranks instead of scores.
+fn ranked(c: VsCollection, picked: [Int], vals: [Float], k: Int) -> [VsHit]
+    var keyed: [(Float, Int)] = []
+    var i = 0
+    for s in vals
+        keyed = list.push(keyed, (0.0 - s, picked[i]))
+        i = i + 1
+    keyed = list.sort(keyed)
+    var out: [VsHit] = []
+    var rank = 1
+    for row in list.take(keyed, k)
+        out = list.push(out, VsHit { id: id_label(c, row.1), score: 0.0 - row.0, distance: 0.0,
+                                     source: VsFromKeyword(rank) })
+        rank = rank + 1
+    out
+
+fn source_for(ranks: [Int]) -> VsSource
+    let vr = rank_at(ranks, 0)
+    let kr = rank_at(ranks, 1)
+    match (vr >= 0, kr >= 0)
+        (true, true)  => VsFromBoth(vr, kr)
+        (true, false) => VsFromVector(vr)
+        _             => VsFromKeyword(kr)
+
+fn rank_at(ranks: [Int], li: Int) -> Int
+    if li < 0 or li >= list.len(ranks)
+        return 0 - 1
+    ranks[li]
+
+fn distance_for(hits: [VsHit], id: Str) -> Float
+    for h in hits
+        if h.id == id
+            return h.distance
+    0.0
+
+fn id_label(c: VsCollection, label: Int) -> Str
+    if label < 0 or label >= list.len(c.docs)
+        return ""
+    let d = c.docs[label]
+    d.id
+
+fn live_label(c: VsCollection, label: Int) -> Bool
+    if label < 0 or label >= list.len(c.docs)
+        return false
+    let d = c.docs[label]
+    not list.contains(c.deleted, d.id)
+
+fn meta_label(c: VsCollection, label: Int) -> JsonValueH
+    if label < 0 or label >= list.len(c.docs)
+        return json.object([])
+    let d = c.docs[label]
+    d.metadata
 
 // Search any store and answer the documents.
 //
@@ -168,7 +352,11 @@ impl VsStore[] for VsMemory
 //     vsstore.retrieve(s, q)
 // ```
 pub fn retrieve<S: VsStore[e]>(s: S, q: VsQuery) -> Result<VsDocResults, VsFault> [e]
-    todo("vectorstore-nv.vsstore.retrieve")
+    let o = s.vs_search(q)!
+    var ids: [Str] = []
+    list.append(ids, list.map(o.hits, h => h.id))
+    let docs = s.vs_get(ids)!
+    Ok(VsDocResults { docs: docs, outcome: o })
 
 // Insert documents in batches, answering how many landed.
 //
@@ -184,7 +372,23 @@ pub fn retrieve<S: VsStore[e]>(s: S, q: VsQuery) -> Result<VsDocResults, VsFault
 //     vsstore.ingest(s, ds, 128)
 // ```
 pub fn ingest<S: VsStore[e]>(s: S, docs: [VsDoc], batch: Int) -> Result<Int, VsFault> [e]
-    todo("vectorstore-nv.vsstore.ingest")
+    let n = list.len(docs)
+    if n == 0
+        return Ok(0)
+    let size = if batch >= 1
+        batch
+    else
+        n
+    var total = 0
+    var at = 0
+    while at < n
+        let end = if at + size < n
+            at + size
+        else
+            n
+        total = total + s.vs_upsert(list.slice(docs, at, end))!
+        at = end
+    Ok(total)
 
 // Whether a store can answer this query at all.
 //
@@ -200,4 +404,10 @@ pub fn ingest<S: VsStore[e]>(s: S, docs: [VsDoc], batch: Int) -> Result<Int, VsF
 //     vsstore.check_query(s, q)
 // ```
 pub fn check_query<S: VsStore[e]>(s: S, q: VsQuery) -> Result<Int, VsFault> [e]
-    todo("vectorstore-nv.vsstore.check_query")
+    // Asked by RUNNING the query rather than by describing it: the
+    // trait has no way to ask a store what it can do, and a
+    // description of a query is exactly the thing that goes stale
+    // when a server is reconfigured.  The answer is the number of
+    // hits, which is the proof it answered at all.
+    let o = s.vs_search(q)!
+    Ok(list.len(o.hits))

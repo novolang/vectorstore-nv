@@ -1,7 +1,5 @@
 // vsrank.nv — merging two rankings, and why it is done by rank.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[]` throughout.
 //
 // **RECIPROCAL RANK FUSION MERGES RANKS, NOT SCORES, AND THAT IS THE
@@ -35,7 +33,12 @@
 // for a caller who has measured their own corpus, and
 // `VsSource.VsFromBoth` is what an explanation shows instead.
 
+// `vssearch` is named below without a `use` line: it imports this module,
+// and the pair is refused as a cycle
+// (language/a-package-module-resolves-a-sibling-s-name-that-it-cannot-import).
 use std.list
+use vsfault
+use vssearch
 
 // How two rankings are merged.
 pub struct VsFusion
@@ -60,7 +63,7 @@ pub struct VsFusion
 //     // : 60
 // ```
 pub fn default_fusion() -> VsFusion []
-    todo("vectorstore-nv.vsrank.default_fusion")
+    VsFusion { k: 60, weights: [] }
 
 // Fusion with a constant and weights of the caller's own.
 //
@@ -72,7 +75,7 @@ pub fn default_fusion() -> VsFusion []
 //     // : 10
 // ```
 pub fn fusion(k: Int, weights: [Float]) -> VsFusion []
-    todo("vectorstore-nv.vsrank.fusion")
+    VsFusion { k: k, weights: weights }
 
 // One ranked list, as ids in order.
 //
@@ -92,7 +95,7 @@ pub struct VsRanking
 //     // : 2
 // ```
 pub fn ranking(ids: [Str]) -> VsRanking []
-    todo("vectorstore-nv.vsrank.ranking")
+    VsRanking { ids: ids }
 
 // Fuse many rankings into one.
 //
@@ -109,7 +112,70 @@ pub fn ranking(ids: [Str]) -> VsRanking []
 //     list.len(vsrank.fuse(vsrank.default_fusion(), [a, b]))
 // ```
 pub fn fuse(f: VsFusion, rankings: [VsRanking]) -> [VsFusedHit] []
-    todo("vectorstore-nv.vsrank.fuse")
+    let lists = list.len(rankings)
+    // Four parallel arrays rather than a list of records: a document
+    // is found once and updated in place as each list is walked, and
+    // the sort that follows is over scalars.
+    var ids: [Str] = []
+    var scores: [Float] = []
+    // One rank per (document, list), -1 where the list did not find it.
+    var ranks: [Int] = []
+    // The first list that found each document, which is the tie-break
+    // that makes two runs over the same data agree.
+    var firsts: [Int] = []
+    var li = 0
+    for r in rankings
+        let w = weight_at(f, li)
+        var ri = 0
+        for id in r.ids
+            let add = contribution(f, ri + 1, w)
+            match list_index(ids, id)
+                None    =>
+                    ids = list.push(ids, id)
+                    scores = list.push(scores, add)
+                    firsts = list.push(firsts, li)
+                    list.append(ranks, list.map(list.range(0, lists), _ => 0 - 1))
+                    ranks[(list.len(ids) - 1) * lists + li] = ri + 1
+                Some(i) =>
+                    scores[i] = scores[i] + add
+                    ranks[i * lists + li] = ri + 1
+            ri = ri + 1
+        li = li + 1
+    var keyed: [(Float, Int, Int, Str, Int)] = []
+    var i = 0
+    for score in scores
+        keyed = list.push(keyed, (0.0 - score, firsts[i], ranks[i * lists + firsts[i]],
+                                  ids[i], i))
+        i = i + 1
+    keyed = list.sort(keyed)
+    var out: [VsFusedHit] = []
+    for row in keyed
+        out = list.push(out, VsFusedHit { id: row.3, score: 0.0 - row.0,
+                                          ranks: ranks_of(ranks, row.4, lists) })
+    out
+
+// The rank a list gave a weight list that does not name it: 1.0.
+//
+// `fuse` answers a list rather than a `Result`, so a weights list of
+// the wrong length cannot be refused here.  `check` is where that is
+// asked, and this is what a caller who skipped it gets.
+fn weight_at(f: VsFusion, li: Int) -> Float
+    if list.len(f.weights) == 0 or li >= list.len(f.weights)
+        return 1.0
+    f.weights[li]
+
+// One document's ranks, in the order the lists were given.
+fn ranks_of(ranks: [Int], i: Int, lists: Int) -> [Int]
+    list.map(list.range(0, lists), li => ranks[i * lists + li])
+
+// The first index of an id, or `None`.
+fn list_index(ids: [Str], id: Str) -> ?Int
+    var at = 0
+    for x in ids
+        if x == id
+            return Some(at)
+        at = at + 1
+    None
 
 // One fused result.
 pub struct VsFusedHit
@@ -138,7 +204,7 @@ pub struct VsFusedHit
 //     // : true
 // ```
 pub fn contribution(f: VsFusion, rank: Int, weight: Float) -> Float []
-    todo("vectorstore-nv.vsrank.contribution")
+    weight / (f.k + rank) as Float
 
 // In how many of the input lists a fused hit appeared.
 //
@@ -153,7 +219,7 @@ pub fn contribution(f: VsFusion, rank: Int, weight: Float) -> Float []
 //     vsrank.found_in(h)
 // ```
 pub fn found_in(h: VsFusedHit) -> Int []
-    todo("vectorstore-nv.vsrank.found_in")
+    list.count(h.ranks, r => r >= 0)
 
 // The first `k` of a fused list.
 //
@@ -164,7 +230,7 @@ pub fn found_in(h: VsFusedHit) -> Int []
 //     list.len(vsrank.take_k(hs, 10))
 // ```
 pub fn take_k(hits: [VsFusedHit], k: Int) -> [VsFusedHit] []
-    todo("vectorstore-nv.vsrank.take_k")
+    list.take(hits, k)
 
 // A ranking from search hits, discarding their scores.
 //
@@ -179,7 +245,9 @@ pub fn take_k(hits: [VsFusedHit], k: Int) -> [VsFusedHit] []
 //     list.len(vsrank.of_hits(hs).ids)
 // ```
 pub fn of_hits(hits: [VsHit]) -> VsRanking []
-    todo("vectorstore-nv.vsrank.of_hits")
+    var ids: [Str] = []
+    list.append(ids, list.map(hits, h => h.id))
+    VsRanking { ids: ids }
 
 // Whether a fusion's weights fit the number of lists it will merge.
 //
@@ -196,7 +264,12 @@ pub fn of_hits(hits: [VsHit]) -> VsRanking []
 //         Err(_) => false
 // ```
 pub fn check(f: VsFusion, list_count: Int) -> Result<Int, VsFault> []
-    todo("vectorstore-nv.vsrank.check")
+    let named = list.len(f.weights)
+    if named == 0 or named == list_count
+        Ok(f.k)
+    else
+        Err(VsBadFilter("weights",
+                        "this fusion names ${named} list(s) and is merging ${list_count}"))
 
 // How much two rankings agree, as the fraction of the first k they
 // share.
@@ -212,4 +285,8 @@ pub fn check(f: VsFusion, list_count: Int) -> Result<Int, VsFault> []
 //     vsrank.overlap(a, b, 10)
 // ```
 pub fn overlap(a: VsRanking, b: VsRanking, k: Int) -> Float []
-    todo("vectorstore-nv.vsrank.overlap")
+    let head = list.take(a.ids, k)
+    if list.len(head) == 0
+        return 0.0
+    let other = list.take(b.ids, k)
+    list.count(head, id => list.contains(other, id)) as Float / list.len(head) as Float

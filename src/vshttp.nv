@@ -1,7 +1,5 @@
 // vshttp.nv — the qdrant and chroma dialects, behind the same trait.
 //
-// Every body here is a `todo()`; the signatures are the design.
-//
 // `[net]` on the store's methods; the request and response shapes are
 // `[]` and published, so a caller with its own HTTP client uses this
 // module's codecs without its transport.
@@ -34,7 +32,33 @@
 //   `VsUnsupportedQuery` naming the server, not a vector search that
 //   quietly dropped its keyword half.
 
+use std.bytes
 use std.json
+use std.list
+use std.net
+use std.str
+use embsim
+use vsdoc
+use vsfault
+use vsfilter
+use vssearch
+use vsstore
+
+// The two payload keys this package writes itself.  A qdrant point's
+// payload is the document's metadata at the top level — a filter names
+// a metadata field and the server has to find it there — so the two
+// keys are reserved and a metadata key of either name is dropped on the
+// way in.
+const PAYLOAD_ID = "id"
+const PAYLOAD_TEXT = "text"
+
+// A metadata field no document has.  It is what the two filters that
+// match nothing are expressed against: a `match` (qdrant) or an `$eq`
+// (chroma) against a field that is never written selects no document.
+// A caller that stores a boolean under this exact name would break
+// `VsNone` against a remote collection; the name is namespaced so that
+// a caller has to mean it.
+const NEVER_FIELD = "__vectorstore_nv_impossible__"
 
 // Which server dialect a client speaks.
 pub enum VsDialect
@@ -56,7 +80,9 @@ pub enum VsDialect
 //     // : qdrant
 // ```
 pub fn dialect_name(d: VsDialect) -> Str []
-    todo("vectorstore-nv.vshttp.dialect_name")
+    match d
+        VsQdrant => "qdrant"
+        VsChroma => "chroma"
 
 // The dialect a name selects.
 //
@@ -70,7 +96,10 @@ pub fn dialect_name(d: VsDialect) -> Str []
 //     // : chroma
 // ```
 pub fn dialect_of_name(name: Str) -> ?VsDialect []
-    todo("vectorstore-nv.vshttp.dialect_of_name")
+    match name
+        "qdrant" => Some(VsQdrant)
+        "chroma" => Some(VsChroma)
+        _        => None
 
 // A remote store.
 pub struct VsHttp
@@ -99,7 +128,8 @@ pub struct VsHttp
 //     // : notes
 // ```
 pub fn qdrant(base_url: Str, collection: Str) -> VsHttp []
-    todo("vectorstore-nv.vshttp.qdrant")
+    VsHttp { dialect: VsQdrant, base_url: base_url, collection: collection, headers: [],
+             model: "" }
 
 // A chroma client.
 //
@@ -111,7 +141,8 @@ pub fn qdrant(base_url: Str, collection: Str) -> VsHttp []
 //     // : chroma
 // ```
 pub fn chroma(base_url: Str, collection: Str) -> VsHttp []
-    todo("vectorstore-nv.vshttp.chroma")
+    VsHttp { dialect: VsChroma, base_url: base_url, collection: collection, headers: [],
+             model: "" }
 
 // The same client with one more header.
 //
@@ -122,7 +153,10 @@ pub fn chroma(base_url: Str, collection: Str) -> VsHttp []
 //     vshttp.with_header(c, "api-key", "secret")
 // ```
 pub fn with_header(c: VsHttp, name: Str, value: Str) -> VsHttp []
-    todo("vectorstore-nv.vshttp.with_header")
+    var hs = c.headers[:]
+    hs = list.push(hs, name + ": " + value)
+    VsHttp { dialect: c.dialect, base_url: c.base_url, collection: c.collection,
+             headers: hs, model: c.model }
 
 // The same client asserting which embedding model the collection
 // holds.
@@ -134,7 +168,340 @@ pub fn with_header(c: VsHttp, name: Str, value: Str) -> VsHttp []
 //     vshttp.with_model(c, "text-embedding-3-small")
 // ```
 pub fn with_model(c: VsHttp, model: Str) -> VsHttp []
-    todo("vectorstore-nv.vshttp.with_model")
+    VsHttp { dialect: c.dialect, base_url: c.base_url, collection: c.collection,
+             headers: c.headers[:], model: model }
+
+// ── The two dialects' spellings ─────────────────────────────────────
+//
+// Every filter and every document body is built here, with no effect
+// row: what a caller gets from `encode_*` is a JSON value it can hand
+// to its own client, and what a caller gets from `decode_*` is what
+// came back.
+
+// A filter value as the JSON both dialects carry it in.
+fn value_as_json(v: VsValue) -> JsonValueH []
+    vsfilter.value_json(v)
+
+// A vector as a JSON array of numbers.
+fn vector_json(v: [Float]) -> JsonValueH []
+    var xs: [Any] = []
+    list.append(xs, list.map(v, x => json.float(x)))
+    json.array(xs)
+
+// A list of filter values as a JSON array.
+fn values_json(vs: [VsValue]) -> JsonValueH []
+    var xs: [Any] = []
+    list.append(xs, list.map(vs, v => value_as_json(v)))
+    json.array(xs)
+
+// Whether the filter is the one that matches everything.  A server is
+// told nothing about it: an empty qdrant filter is legal and an empty
+// chroma `where` is not, and neither says anything.
+fn matches_all(f: VsFilter) -> Bool []
+    match f
+        VsAll => true
+        _     => false
+
+// The name of the body member a filter travels in.
+fn filter_key(d: VsDialect) -> Str []
+    match d
+        VsQdrant => "filter"
+        VsChroma => "where"
+
+// The filter appended to a pair list, or nothing appended when it
+// matches everything.  A `var` parameter because it writes into the
+// caller's list; a request body is built up a member at a time.
+fn add_filter(var pairs: [Any], d: VsDialect, f: VsFilter)
+    if matches_all(f)
+        ()
+    else
+        list.push(pairs, (filter_key(d), filter_json(d, f)))
+
+// The filter in a dialect's own spelling, for a caller that has already
+// been through `encode_filter` — which is the only caller there is, and
+// it is why the chroma half cannot refuse here.
+fn filter_json(d: VsDialect, f: VsFilter) -> JsonValueH []
+    match d
+        VsQdrant => qdrant_filter(f)
+        VsChroma =>
+            // An empty object rather than a raise: every body that
+            // reaches here called `encode_filter` with the same filter
+            // first, and that is where a chroma refusal is answered.
+            match chroma_filter(f)
+                Ok(v)  => v
+                // cov: skip — `add_filter` is the only caller and every
+                // body that reaches it ran `encode_filter` over the same
+                // filter first, which is where a chroma refusal is
+                // answered; `chroma_filter` refuses exactly the clauses
+                // `encode_filter` does.
+                Err(_) => json.object([])
+
+// ── qdrant ──────────────────────────────────────────────────────────
+
+// `{"key": f, "match": {"value": v}}`: an exact value, and qdrant
+// matches array membership with the same condition.
+fn qdrant_match(f: Str, v: VsValue) -> JsonValueH []
+    json.object([("key", json.string(f)),
+                 ("match", json.object([("value", value_as_json(v))]))])
+
+// A condition inside a `must_not` list.  qdrant accepts a filter object
+// as a member of `must`, `should` and `must_not` alike, so this nests.
+fn qdrant_must_not(inner: JsonValueH) -> JsonValueH []
+    json.object([("must_not", json.array([inner]))])
+
+fn qdrant_range(f: Str, op: Str, v: VsValue) -> JsonValueH []
+    json.object([("key", json.string(f)),
+                 ("range", json.object([(op, value_as_json(v))]))])
+
+fn qdrant_empty(f: Str) -> JsonValueH []
+    json.object([("is_empty", json.object([("key", json.string(f))]))])
+
+// One clause in qdrant's spelling.
+fn qdrant_clause(c: VsClause) -> JsonValueH []
+    match c
+        VsEq(f, v)        => qdrant_match(f, v)
+        VsNe(f, v)        => qdrant_must_not(qdrant_match(f, v))
+        VsLt(f, v)        => qdrant_range(f, "lt", v)
+        VsLte(f, v)       => qdrant_range(f, "lte", v)
+        VsGt(f, v)        => qdrant_range(f, "gt", v)
+        VsGte(f, v)       => qdrant_range(f, "gte", v)
+        VsIn(f, vs)       =>
+            json.object([("key", json.string(f)),
+                         ("match", json.object([("any", values_json(vs))]))])
+        // qdrant's `match` is membership when the payload field is an
+        // array, which is exactly what a contains means.
+        VsContains(f, v)  => qdrant_match(f, v)
+        // `is_empty` matches a field that "does not exist, or has null
+        // or [] value" — which is this package's `VsMissing` exactly,
+        // since `VsMissing` counts absent and null as one state.
+        VsExists(f)       => qdrant_must_not(qdrant_empty(f))
+        VsMissing(f)      => qdrant_empty(f)
+        VsPrefix(f, text) =>
+            json.object([("key", json.string(f)),
+                         ("match", json.object([("prefix", json.string(text))]))])
+
+fn qdrant_parts(parts: [VsFilter]) -> [JsonValueH] []
+    list.map(parts, p => qdrant_filter(p))
+
+// A filter in qdrant's spelling.
+fn qdrant_filter(f: VsFilter) -> JsonValueH []
+    match f
+        VsAll        => json.object([])
+        // THE IMPOSSIBLE CONDITION GOES IN `must`, NOT `must_not`.
+        // qdrant's `must_not` is `(NOT A) AND (NOT B)`: a condition on
+        // a field a point does not have is not satisfied, so that point
+        // SATISFIES the `must_not` and comes back.  Written that way
+        // "match nothing" matched every point qdrant had — which is
+        // `VsAll`, the one answer this arm exists to not give.  A
+        // `must` over the same condition excludes every point instead.
+        VsNone       => json.object([("must",
+                                      json.array([qdrant_match(NEVER_FIELD,
+                                                               VsBool(true))]))])
+        VsIs(c)      => qdrant_clause(c)
+        VsNot(c)     => qdrant_must_not(qdrant_clause(c))
+        VsAnd(parts) => json.object([("must", json.array(qdrant_parts(parts)))])
+        VsOr(parts)  => json.object([("should", json.array(qdrant_parts(parts)))])
+
+// ── chroma ──────────────────────────────────────────────────────────
+
+// `{"f": {"$op": v}}`: chroma's one-field condition, which is the only
+// shape its `where` takes.
+fn chroma_op(f: Str, op: Str, v: JsonValueH) -> JsonValueH []
+    json.object([(f, json.object([(op, v)]))])
+
+fn chroma_refuse(f: Str, what: Str) -> VsFault []
+    VsUnsupportedQuery("${what} on ${f}: chroma has no operator for it")
+
+// One clause in chroma's spelling.
+//
+// The second half of the module header's disclosure: three clauses have
+// no chroma operator at all.
+fn chroma_clause(c: VsClause) -> Result<JsonValueH, VsFault> []
+    match c
+        VsEq(f, v)       => Ok(chroma_op(f, "\$eq", value_as_json(v)))
+        VsNe(f, v)       => Ok(chroma_op(f, "\$ne", value_as_json(v)))
+        VsLt(f, v)       => Ok(chroma_op(f, "\$lt", value_as_json(v)))
+        VsLte(f, v)      => Ok(chroma_op(f, "\$lte", value_as_json(v)))
+        VsGt(f, v)       => Ok(chroma_op(f, "\$gt", value_as_json(v)))
+        VsGte(f, v)      => Ok(chroma_op(f, "\$gte", value_as_json(v)))
+        VsIn(f, vs)      => Ok(chroma_op(f, "\$in", values_json(vs)))
+        // chroma's own array membership, and the reason `VsContains`
+        // exists rather than being flattened into an `$in`.
+        VsContains(f, v) => Ok(chroma_op(f, "\$contains", value_as_json(v)))
+        VsPrefix(f, _)   => Err(chroma_refuse(f, "a prefix match"))
+        VsExists(f)      => Err(chroma_refuse(f, "an existence test"))
+        VsMissing(f)     => Err(chroma_refuse(f, "an absence test"))
+
+// The complement of a clause.
+//
+// chroma has no `$not`, so a negated clause becomes the operator that
+// is its complement — and the complement is exact for a field the
+// document HAS.  On a field it does not have the two answers part
+// company, because `vsfilter.matches` refuses to compare a missing
+// field and the server answers that the missing value is not equal to
+// the one asked about.  That is the "missing field" the module header
+// names.
+fn chroma_negate(c: VsClause) -> Result<JsonValueH, VsFault> []
+    match c
+        VsEq(f, v)       => Ok(chroma_op(f, "\$ne", value_as_json(v)))
+        VsNe(f, v)       => Ok(chroma_op(f, "\$eq", value_as_json(v)))
+        VsLt(f, v)       => Ok(chroma_op(f, "\$gte", value_as_json(v)))
+        VsLte(f, v)      => Ok(chroma_op(f, "\$gt", value_as_json(v)))
+        VsGt(f, v)       => Ok(chroma_op(f, "\$lte", value_as_json(v)))
+        VsGte(f, v)      => Ok(chroma_op(f, "\$lt", value_as_json(v)))
+        VsIn(f, vs)      => Ok(chroma_op(f, "\$nin", values_json(vs)))
+        VsContains(f, v) => Ok(chroma_op(f, "\$not_contains", value_as_json(v)))
+        VsPrefix(f, _)   => Err(chroma_refuse(f, "a negated prefix match"))
+        VsExists(f)      => Err(chroma_refuse(f, "the negation of an existence test"))
+        VsMissing(f)     => Err(chroma_refuse(f, "the negation of an absence test"))
+
+fn chroma_parts(op: Str, parts: [VsFilter]) -> Result<JsonValueH, VsFault> []
+    var out: [Any] = []
+    for p in parts
+        let one = chroma_filter(p)!
+        out = list.push(out, one)
+    Ok(json.object([(op, json.array(out))]))
+
+// A filter in chroma's spelling.
+fn chroma_filter(f: VsFilter) -> Result<JsonValueH, VsFault> []
+    match f
+        VsAll        => Ok(json.object([]))
+        VsNone       => Ok(chroma_op(NEVER_FIELD, "\$eq", json.bool(true)))
+        VsIs(c)      => chroma_clause(c)
+        VsNot(c)     => chroma_negate(c)
+        VsAnd(parts) => chroma_parts("\$and", parts)
+        VsOr(parts)  => chroma_parts("\$or", parts)
+
+// ── documents ───────────────────────────────────────────────────────
+
+// The payload this package writes for a qdrant point: the document's
+// metadata at the top level, plus the two reserved keys.
+fn payload_of(d: VsDoc) -> JsonValueH []
+    var pairs: [Any] = []
+    for k in json.keys(d.metadata)
+        if k != PAYLOAD_ID and k != PAYLOAD_TEXT
+            match json.get(d.metadata, k)
+                // cov: skip — a key `json.keys` listed is a key
+                // `json.get` answers: it answers `Some(null)` for a
+                // member whose value is null, so the miss arm is a
+                // reader that cannot fail on the key it was handed.
+                None    => ()
+                Some(v) =>
+                    pairs = list.push(pairs, (k, v))
+    pairs = list.push(pairs, (PAYLOAD_ID, json.string(d.id)))
+    pairs = list.push(pairs, (PAYLOAD_TEXT, json.string(d.text)))
+    json.object(pairs)
+
+// The metadata a qdrant payload holds, which is everything but the two
+// reserved keys.
+fn meta_of(payload: JsonValueH) -> JsonValueH []
+    var pairs: [Any] = []
+    for k in json.keys(payload)
+        if k != PAYLOAD_ID and k != PAYLOAD_TEXT
+            match json.get(payload, k)
+                // cov: skip — the reason above: `json.keys` and
+                // `json.get` agree on every member, null included.
+                None    => ()
+                Some(v) =>
+                    pairs = list.push(pairs, (k, v))
+    json.object(pairs)
+
+// A point id as text: qdrant answers an integer for a numeric point and
+// a UUID string for the rest.
+fn id_text(v: JsonValueH) -> Str []
+    match json.to_str(v)
+        Some(s) => s
+        None    => str.from_int(json.to_int(v) ?? 0)
+
+// One payload field, or the fallback.
+fn payload_str(p: JsonValueH, key: Str, fallback: Str) -> Str []
+    match json.get_str(p, key)
+        Some(s) => s
+        None    => fallback
+
+// JSON numbers as floats.
+fn floats_of(xs: [JsonValueH]) -> [Float] []
+    list.map(xs, x => json.to_float(x) ?? 0.0)
+
+// One row of a chroma embedding list.
+fn float_row(v: JsonValueH) -> [Float] []
+    match json.to_list(v)
+        None     => []
+        Some(xs) => floats_of(xs)
+
+// A reply body as a JSON value.
+fn parse_body(body: Str, what: Str) -> Result<JsonValueH, VsFault> []
+    match json.parse(body)
+        None    => Err(VsMalformedReply(what))
+        Some(v) => Ok(v)
+
+// One JSON member, or a fresh empty object when the key is absent.
+//
+// A `match` and not `json.get(v, key) ?? json.object([])`: the miss
+// path of that `??` leaks the fallback it evaluates, one object per
+// call, filed at
+// `novo/memory-perceus/a-null-coalesce-fallback-over-list-get-first-or-json-get-is-leaked-on-the-miss-path-and-dropped-in-one-tail-shape`.
+fn object_member(v: JsonValueH, key: Str) -> JsonValueH []
+    match json.get(v, key)
+        None    => json.object([])
+        Some(x) => x
+
+// One qdrant point as a document.
+fn qdrant_doc(r: JsonValueH) -> VsDoc []
+    let payload = object_member(r, "payload")
+    let raw_id = json.get(r, "id") ?? json.null()
+    VsDoc { id: payload_str(payload, PAYLOAD_ID, id_text(raw_id)),
+            text: payload_str(payload, PAYLOAD_TEXT, ""),
+            metadata: meta_of(payload),
+            vector: floats_of(json.get_list(r, "vector") ?? []) }
+
+// One qdrant point as a hit.
+fn qdrant_hit(r: JsonValueH, rank: Int) -> Result<VsHit, VsFault> []
+    let score = json.get_float(r, "score") ?? 0.0
+    let doc = qdrant_doc(r)
+    Ok(VsHit { id: doc.id, score: score, distance: embsim.as_distance(score),
+               source: VsFromVector(rank) })
+
+// What a remote answer is, as this package's result.
+//
+// **`exhaustive` IS ALWAYS FALSE HERE.**  A server walks its own graph
+// and answers the best it found; it does not say whether it considered
+// every match, and neither dialect's reply carries a field for it.  A
+// remote result is a filtered traversal as far as a caller can tell,
+// and the reply's cost accounting — `examined`, `filtered_out` — is not
+// in it either, so `examined` counts the hits that came back and
+// `filtered_out` is zero.
+fn remote_outcome(hits: [VsHit]) -> VsSearchOutcome []
+    VsSearchOutcome { hits: hits, exhaustive: false, plan: VsFilteredTraversal,
+                      examined: list.len(hits), filtered_out: 0 }
+
+// A chroma reply's first inner list: chroma answers one list per query
+// and this package sends one query.
+fn nested_list(doc: JsonValueH, key: Str) -> Result<[JsonValueH], VsFault> []
+    // The noun phrases are bare because `VsMalformedReply` reads
+    // "the reply had no ${what}".
+    match json.get_list(doc, key)
+        None     => Err(VsMalformedReply("${key} list"))
+        Some(ls) =>
+            match list.first(ls)
+                None        => Err(VsMalformedReply("${key} list with a page in it"))
+                Some(inner) =>
+                    match json.to_list(inner)
+                        None     => Err(VsMalformedReply("${key} list of lists"))
+                        Some(xs) => Ok(xs)
+
+// The documents in the order they were asked for.
+//
+// `vsdoc.get_many` answers in the asked order locally, so a store that
+// answered a server's own order would be a different contract from one
+// dialect to the other.
+fn in_order(docs: [VsDoc], ids: [Str]) -> [VsDoc] []
+    var out: [VsDoc] = []
+    for id in ids
+        for d in docs
+            if d.id == id
+                out = list.push(out, d)
+    out
 
 // A filter in the dialect's own spelling.
 //
@@ -155,7 +522,14 @@ pub fn with_model(c: VsHttp, model: Str) -> VsHttp []
 //     // : object
 // ```
 pub fn encode_filter(d: VsDialect, f: VsFilter) -> Result<JsonValueH, VsFault> []
-    todo("vectorstore-nv.vshttp.encode_filter")
+    // The refusals first, and on the filter as written: simplifying
+    // first would turn an empty conjunction into `VsAll`, and an empty
+    // conjunction is one of the things that must not be answered.
+    vsfilter.check(f)!
+    let simple = vsfilter.simplify(f)
+    match d
+        VsQdrant => Ok(qdrant_filter(simple))
+        VsChroma => chroma_filter(simple)
 
 // A search request body in the dialect's own spelling.
 //
@@ -170,7 +544,59 @@ pub fn encode_filter(d: VsDialect, f: VsFilter) -> Result<JsonValueH, VsFault> [
 //         Err(_) => false
 // ```
 pub fn encode_search(c: VsHttp, q: VsQuery) -> Result<JsonValueH, VsFault> []
-    todo("vectorstore-nv.vshttp.encode_search")
+    check_dialect_query(c.dialect, q)!
+    model_check(c, q.model)!
+    let _ = encode_filter(c.dialect, q.filter)!
+    match c.dialect
+        VsQdrant => Ok(qdrant_search(q))
+        VsChroma => Ok(chroma_search(q))
+
+// Whether the dialect can carry the query at all, and how many results
+// it was asked for.
+fn check_dialect_query(d: VsDialect, q: VsQuery) -> Result<Int, VsFault> []
+    if q.k <= 0
+        return Err(VsUnsupportedQuery("a search for ${q.k} results"))
+    match d
+        VsQdrant => Ok(q.k)
+        VsChroma =>
+            if not str.is_empty(q.text)
+                Err(VsUnsupportedQuery("a keyword or hybrid search: chroma has no sparse vectors"))
+            elif list.len(q.vector) == 0
+                Err(VsUnsupportedQuery("a search with neither a vector nor a keyword half"))
+            else
+                Ok(q.k)
+
+// The model the query's vector came from against the client's, when
+// either names one.
+fn model_check(c: VsHttp, model: Str) -> Result<Int, VsFault> []
+    if str.is_empty(model) or str.is_empty(c.model) or model == c.model
+        return Ok(0)
+    Err(VsModelMismatch(c.model, model))
+
+fn qdrant_search(q: VsQuery) -> JsonValueH []
+    var pairs: [Any] = []
+    pairs = list.push(pairs, ("vector", vector_json(q.vector)))
+    pairs = list.push(pairs, ("limit", json.int(q.k)))
+    pairs = list.push(pairs, ("with_payload", json.bool(true)))
+    pairs = list.push(pairs, ("with_vector", json.bool(true)))
+    if q.ef > 0
+        pairs = list.push(pairs, ("params", json.object([("hnsw_ef", json.int(q.ef))])))
+    add_filter(var pairs, VsQdrant, q.filter)
+    json.object(pairs)
+
+fn chroma_search(q: VsQuery) -> JsonValueH []
+    var embeddings: [Any] = []
+    embeddings = list.push(embeddings, vector_json(q.vector))
+    var includes: [Any] = []
+    includes = list.push(includes, json.string("distances"))
+    includes = list.push(includes, json.string("documents"))
+    includes = list.push(includes, json.string("metadatas"))
+    var pairs: [Any] = []
+    pairs = list.push(pairs, ("query_embeddings", json.array(embeddings)))
+    pairs = list.push(pairs, ("n_results", json.int(q.k)))
+    pairs = list.push(pairs, ("include", json.array(includes)))
+    add_filter(var pairs, VsChroma, q.filter)
+    json.object(pairs)
 
 // An upsert request body.
 //
@@ -185,7 +611,43 @@ pub fn encode_search(c: VsHttp, q: VsQuery) -> Result<JsonValueH, VsFault> []
 //         Err(_) => false
 // ```
 pub fn encode_upsert(c: VsHttp, docs: [VsDoc]) -> Result<JsonValueH, VsFault> []
-    todo("vectorstore-nv.vshttp.encode_upsert")
+    match c.dialect
+        VsQdrant => Ok(qdrant_upsert(docs))
+        VsChroma => Ok(chroma_upsert(docs))
+
+fn qdrant_upsert(docs: [VsDoc]) -> JsonValueH []
+    var points: [Any] = []
+    for d in docs
+        var p: [Any] = []
+        p = list.push(p, ("id", json.string(point_id(VsQdrant, d.id))))
+        p = list.push(p, ("vector", vector_json(d.vector)))
+        p = list.push(p, ("payload", payload_of(d)))
+        points = list.push(points, json.object(p))
+    json.object([("points", json.array(points))])
+
+// chroma takes the four lists side by side, and the text is its own
+// `documents` field rather than a metadata key.
+//
+// Its metadata values are scalars and flat arrays of scalars, so a
+// metadata object with a nested object in it is the server's to refuse
+// — this package passes the document's metadata through unchanged
+// rather than flattening a caller's data behind their back.
+fn chroma_upsert(docs: [VsDoc]) -> JsonValueH []
+    var ids: [Any] = []
+    var embeddings: [Any] = []
+    var documents: [Any] = []
+    var metadatas: [Any] = []
+    for d in docs
+        ids = list.push(ids, json.string(point_id(VsChroma, d.id)))
+        embeddings = list.push(embeddings, vector_json(d.vector))
+        documents = list.push(documents, json.string(d.text))
+        metadatas = list.push(metadatas, d.metadata)
+    var pairs: [Any] = []
+    pairs = list.push(pairs, ("ids", json.array(ids)))
+    pairs = list.push(pairs, ("embeddings", json.array(embeddings)))
+    pairs = list.push(pairs, ("documents", json.array(documents)))
+    pairs = list.push(pairs, ("metadatas", json.array(metadatas)))
+    json.object(pairs)
 
 // A search response as hits.
 //
@@ -204,7 +666,38 @@ pub fn encode_upsert(c: VsHttp, docs: [VsDoc]) -> Result<JsonValueH, VsFault> []
 //         Err(_) => false
 // ```
 pub fn decode_search(c: VsHttp, body: Str) -> Result<VsSearchOutcome, VsFault> []
-    todo("vectorstore-nv.vshttp.decode_search")
+    match c.dialect
+        VsQdrant => qdrant_hits(body)
+        VsChroma => chroma_hits(body)
+
+// qdrant answers the score it ranked by, and ranks by it: a similarity
+// for a cosine or dot collection.  It is read as the similarity the
+// rest of this package uses, and `VsHit.distance` is its inverse by
+// `embsim.as_distance`.
+fn qdrant_hits(body: Str) -> Result<VsSearchOutcome, VsFault> []
+    let doc = parse_body(body, "JSON object")!
+    match json.get_list(doc, "result")
+        None     => Err(VsMalformedReply("result list"))
+        Some(rs) =>
+            var hits: [VsHit] = []
+            var i = 0
+            while i < list.len(rs)
+                hits = list.push(hits, qdrant_hit(rs[i], i + 1)!)
+                i = i + 1
+            Ok(remote_outcome(hits))
+
+// chroma answers a distance always, and one row per query.
+fn chroma_hits(body: Str) -> Result<VsSearchOutcome, VsFault> []
+    let doc = parse_body(body, "JSON object")!
+    let ids = nested_list(doc, "ids")!
+    let dists = nested_list(doc, "distances")!
+    var hits: [VsHit] = []
+    for i in 0..list.len(ids)
+        let dist = json.to_float(list.get(dists, i) ?? json.null()) ?? 0.0
+        hits = list.push(hits, VsHit { id: json.to_str(ids[i]) ?? "",
+                                       score: embsim.as_distance(dist),
+                                       distance: dist, source: VsFromVector(i + 1) })
+    Ok(remote_outcome(hits))
 
 // A get response as documents.
 //
@@ -219,7 +712,41 @@ pub fn decode_search(c: VsHttp, body: Str) -> Result<VsSearchOutcome, VsFault> [
 //         Err(_) => false
 // ```
 pub fn decode_get(c: VsHttp, body: Str) -> Result<[VsDoc], VsFault> []
-    todo("vectorstore-nv.vshttp.decode_get")
+    match c.dialect
+        VsQdrant => qdrant_docs(body)
+        VsChroma => chroma_docs(body)
+
+fn qdrant_docs(body: Str) -> Result<[VsDoc], VsFault> []
+    let doc = parse_body(body, "JSON object")!
+    match json.get_list(doc, "result")
+        None     => Err(VsMalformedReply("result list"))
+        Some(rs) =>
+            Ok(list.map(rs, r => qdrant_doc(r)))
+
+// chroma answers the four lists side by side, and any of the three
+// after `ids` may be missing: a `get` asks for what it wants.
+fn chroma_docs(body: Str) -> Result<[VsDoc], VsFault> []
+    let doc = parse_body(body, "JSON object")!
+    match json.get_list(doc, "ids")
+        None      => Err(VsMalformedReply("ids list"))
+        Some(ids) =>
+            let texts = json.get_list(doc, "documents") ?? []
+            let metas = json.get_list(doc, "metadatas") ?? []
+            let embs = json.get_list(doc, "embeddings") ?? []
+            var out: [VsDoc] = []
+            for i in 0..list.len(ids)
+                // The three-argument get and not
+                // `?? json.object([])`: the miss path of that `??`
+                // leaks the object it evaluates, one per call, filed
+                // at
+                // `novo/memory-perceus/a-null-coalesce-fallback-over-list-get-first-or-json-get-is-leaked-on-the-miss-path-and-dropped-in-one-tail-shape`.
+                let meta = list.get(metas, i, json.object([]))
+                out = list.push(out, VsDoc {
+                    id: json.to_str(ids[i]) ?? "",
+                    text: json.to_str(list.get(texts, i) ?? json.null()) ?? "",
+                    metadata: meta,
+                    vector: float_row(list.get(embs, i) ?? json.null()) })
+            Ok(out)
 
 // A non-2xx status and body as a fault.
 //
@@ -234,7 +761,31 @@ pub fn decode_get(c: VsHttp, body: Str) -> Result<[VsDoc], VsFault> []
 //     // : true
 // ```
 pub fn decode_error(d: VsDialect, status: Int, body: Str) -> VsFault []
-    todo("vectorstore-nv.vshttp.decode_error")
+    match d
+        VsQdrant => qdrant_error(status, body)
+        VsChroma => chroma_error(status, body)
+
+// qdrant names no code: its sentence is inside `status.error`, and it
+// is that sentence a caller reads.
+fn qdrant_error(status: Int, body: Str) -> VsFault []
+    match json.parse(body)
+        None    => VsRemoteFailed(status, "", body)
+        Some(v) =>
+            match json.get(v, "status")
+                None     => VsRemoteFailed(status, "", body)
+                Some(st) =>
+                    match json.get_str(st, "error")
+                        None    => VsRemoteFailed(status, "", body)
+                        Some(e) => VsRemoteFailed(status, "", e)
+
+// chroma answers `{"error": "<name>", "message": "<sentence>"}`.
+fn chroma_error(status: Int, body: Str) -> VsFault []
+    match json.parse(body)
+        None    => VsRemoteFailed(status, "", body)
+        Some(v) =>
+            let code = json.get_str(v, "error") ?? ""
+            let why = json.get_str(v, "message") ?? body
+            VsRemoteFailed(status, code, why)
 
 // The path a request goes to.
 //
@@ -248,7 +799,9 @@ pub fn decode_error(d: VsDialect, status: Int, body: Str) -> VsFault []
 //     vshttp.search_path(c)
 // ```
 pub fn search_path(c: VsHttp) -> Str []
-    todo("vectorstore-nv.vshttp.search_path")
+    match c.dialect
+        VsQdrant => "/collections/${c.collection}/points/search"
+        VsChroma => "/api/v1/collections/${c.collection}/query"
 
 // The upsert path.
 //
@@ -259,7 +812,9 @@ pub fn search_path(c: VsHttp) -> Str []
 //     vshttp.upsert_path(c)
 // ```
 pub fn upsert_path(c: VsHttp) -> Str []
-    todo("vectorstore-nv.vshttp.upsert_path")
+    match c.dialect
+        VsQdrant => "/collections/${c.collection}/points/upsert"
+        VsChroma => "/api/v1/collections/${c.collection}/upsert"
 
 // The id this document will have on the server.
 //
@@ -276,7 +831,127 @@ pub fn upsert_path(c: VsHttp) -> Str []
 //     vshttp.point_id(d, id)
 // ```
 pub fn point_id(d: VsDialect, id: Str) -> Str []
-    todo("vectorstore-nv.vshttp.point_id")
+    match d
+        VsChroma => id
+        VsQdrant =>
+            if is_plain_point_id(id)
+                id
+            else
+                name_uuid(id)
+
+// Whether qdrant takes the id as it stands: an unsigned integer, or a
+// UUID.
+fn is_plain_point_id(id: Str) -> Bool []
+    if is_digits(id)
+        return true
+    is_uuid_shape(id)
+
+fn is_digits(s: Str) -> Bool []
+    if str.is_empty(s)
+        return false
+    var ok = true
+    for ch in str.chars(s)
+        if ch < "0" or ch > "9"
+            ok = false
+    ok
+
+fn is_uuid_shape(s: Str) -> Bool []
+    let parts = str.split(s, "-")
+    if list.len(parts) != 5
+        return false
+    if str.len(parts[0]) != 8 or str.len(parts[1]) != 4 or str.len(parts[2]) != 4
+        return false
+    if str.len(parts[3]) != 4 or str.len(parts[4]) != 12
+        return false
+    var hexes = true
+    for p in parts
+        if not is_hex(p)
+            hexes = false
+    hexes
+
+fn is_hex(s: Str) -> Bool []
+    var ok = true
+    for ch in str.chars(s)
+        if not is_hex_digit(ch)
+            ok = false
+    ok
+
+fn is_hex_digit(ch: Str) -> Bool []
+    if ch >= "0" and ch <= "9"
+        return true
+    if ch >= "a" and ch <= "f"
+        return true
+    ch >= "A" and ch <= "F"
+
+// A UUID derived from the id's bytes.
+//
+// The version nibble says 8 — RFC 9562's "custom" — rather than
+// claiming v5: this is a mixing function, not SHA-1, and two
+// implementations that agree about an id do not thereby agree about its
+// UUID unless they agree about this function.  The point of it is only
+// that a caller's id is stable across calls and across processes.
+fn name_uuid(id: Str) -> Str []
+    let h = hex32(mix(id, 17)) + hex32(mix(id, 1000003))
+            + hex32(mix(id, 2654435761)) + hex32(mix(id, 4294967291))
+    let cs = str.chars(h)
+    var out = ""
+    for i in 0..32
+        if i == 8 or i == 12 or i == 16 or i == 20
+            out = out + "-"
+        if i == 12
+            out = out + "8"
+        elif i == 16
+            out = out + variant_of(list.get(cs, i) ?? "0")
+        else
+            out = out + (list.get(cs, i) ?? "0")
+    out
+
+// A 32-bit mix of a string, seeded: the same id and seed answer the
+// same number in every process, which is what `point_id` promises.
+fn mix(s: Str, seed: Int) -> Int []
+    var h = seed
+    var i = 0
+    let n = str.len(s)
+    while i < n
+        let b = str.byte_at_or(s, i, 0)
+        h = (h * 31 + b) % 4294967296
+        i = i + 1
+    h
+
+// 32 bits as eight lower-case hex digits.
+fn hex32(n: Int) -> Str []
+    var out = ""
+    var x = n % 4294967296
+    var i = 0
+    while i < 8
+        out = nibble(x % 16) + out
+        x = x / 16
+        i = i + 1
+    out
+
+// One hex digit.
+fn nibble(d: Int) -> Str []
+    let digits = ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9",
+                  "a", "b", "c", "d", "e", "f"]
+    list.get(digits, d % 16) ?? "0"
+
+// One hex digit forced into the 10xx range a UUID's variant field
+// holds.
+fn variant_of(ch: Str) -> Str []
+    nibble(8 + hex_value(ch) % 4)
+
+fn hex_value(ch: Str) -> Int []
+    match str.to_int(ch)
+        Some(n) => n
+        None    => hex_letter(ch)
+
+fn hex_letter(ch: Str) -> Int []
+    let letters = ["a", "b", "c", "d", "e", "f"]
+    var out = 10
+    for i in 0..6
+        if (list.get(letters, i) ?? "") == ch
+            out = 10 + i
+    out
 
 // Whether a dialect can answer this query.
 //
@@ -292,7 +967,272 @@ pub fn point_id(d: VsDialect, id: Str) -> Str []
 //         Err(_) => false
 // ```
 pub fn check_query(d: VsDialect, q: VsQuery) -> Result<Int, VsFault> []
-    todo("vectorstore-nv.vshttp.check_query")
+    check_dialect_query(d, q)
+
+// ── The transport ───────────────────────────────────────────────────
+//
+// HTTP/1.1 over `std.net`, and over `std.tls` for an `https://` base
+// URL.  Both are `[net]` and nothing here is anything but `[net]`: a
+// request is one `send`, the reply is read to the socket's end, and
+// `Connection: close` is what makes the second half true.
+//
+// The reply is not dechunked.  A `Content-Length` reply — which is
+// what both servers send for the JSON bodies this package asks for —
+// is cut to its own length and parsed; a reply in chunked encoding
+// arrives as its chunk headers and is refused as malformed JSON rather
+// than silently mis-read.
+
+struct VsEndpoint
+    secure: Bool
+    host: Str
+    port: Int
+    // The path on the base URL, if the URL had one, without a trailing
+    // slash.  A client behind a proxy that mounts the server under a
+    // prefix needs it in front of every dialect path.
+    prefix: Str
+
+// A base URL as its four parts.
+fn endpoint_of(base_url: Str, fallback: Int) -> Result<VsEndpoint, VsFault> []
+    if str.starts_with(base_url, "https://")
+        return authority_of(str.slice(base_url, 8, str.len(base_url)), fallback, true)
+    if str.starts_with(base_url, "http://")
+        return authority_of(str.slice(base_url, 7, str.len(base_url)), fallback, false)
+    Err(VsTransportFailed("${base_url} does not begin with http:// or https://"))
+
+fn authority_of(rest: Str, fallback: Int, secure: Bool) -> Result<VsEndpoint, VsFault> []
+    let host_port = authority_part(rest)
+    let prefix = path_part(rest)
+    match str.index(host_port, ":")
+        None     => Ok(VsEndpoint { secure: secure, host: host_port, port: fallback,
+                                   prefix: prefix })
+        Some(at) =>
+            let port_text = str.slice(host_port, at + 1, str.len(host_port))
+            match str.to_int(port_text)
+                None    => Err(VsTransportFailed("${port_text} is not a port in ${host_port}"))
+                Some(p) => Ok(VsEndpoint { secure: secure, host: str.slice(host_port, 0, at),
+                                           port: p, prefix: prefix })
+
+fn authority_part(rest: Str) -> Str []
+    match str.index(rest, "/")
+        None     => rest
+        Some(at) => str.slice(rest, 0, at)
+
+fn path_part(rest: Str) -> Str []
+    match str.index(rest, "/")
+        None     => ""
+        Some(at) => without_trailing_slash(str.slice(rest, at, str.len(rest)))
+
+fn without_trailing_slash(p: Str) -> Str []
+    if str.ends_with(p, "/")
+        str.slice(p, 0, str.len(p) - 1)
+    else
+        p
+
+// The port a dialect listens on when the URL names none.
+fn default_port(d: VsDialect) -> Int []
+    match d
+        VsQdrant => 6333
+        VsChroma => 8000
+
+// One connection, either kind.  `Sock` and a TLS handle are two types,
+// so one of these has to hold both.
+enum VsConn
+    VsPlain(sock: Sock)
+    VsSecure(conn: Int)
+
+fn vs_connect(host: Str, port: Int, secure: Bool) -> Result<VsConn, VsFault> [net]
+    if secure
+        return secure_connect(host, port)
+    match net.connect(host, port)
+        None    => Err(VsTransportFailed("nothing accepted a connection to ${host}:${port}"))
+        Some(s) => Ok(VsPlain(s))
+
+fn secure_connect(host: Str, port: Int) -> Result<VsConn, VsFault> [net]
+    match tls.connect(host, port, tls.config_for_client(host))
+        None    => Err(VsTransportFailed("the TLS connection to ${host}:${port} failed: "
+                                      + tls.last_error()))
+        // cov: skip — TLS is the one arm a test cannot stand up here: it
+        // needs a server with a certificate, and the listener this
+        // suite serves over the loopback is a plain socket.  The refusal
+        // half above is reached, and it is reached for real.
+        Some(c) => Ok(VsSecure(c))
+
+fn conn_send(c: VsConn, data: Str) -> Bool [net]
+    match c
+        VsPlain(s)   =>
+            net.send(s, data)
+        // cov: skip — the TLS half of the transport, unreachable for the
+        // reason above: no secure connection is ever established.
+        VsSecure(fd) =>
+            tls.send(fd, bytes.from_str(data))
+
+fn conn_recv(c: VsConn, n: Int) -> ?Str [net]
+    match c
+        VsPlain(s)   =>
+            net.recv(s, n)
+        // cov: skip — the TLS half of the transport, unreachable for the
+        // reason above: no secure connection is ever established, so
+        // neither reader arm below it can run.
+        VsSecure(fd) =>
+            match tls.recv(fd, n)
+                None    => None
+                Some(b) => Some(bytes.to_str(b))
+
+fn conn_close(c: VsConn) [net]
+    match c
+        VsPlain(s)   =>
+            net.close(s)
+        // cov: skip — the TLS half of the transport, unreachable for the
+        // reason above: there is no secure connection to close.
+        VsSecure(fd) =>
+            tls.close(fd)
+
+// Everything the peer sends, up to its close.
+fn read_to_end(c: VsConn) -> Str [net]
+    var parts: [Str] = []
+    var going = true
+    while going
+        match conn_recv(c, 8192)
+            None        =>
+                going = false
+            Some(chunk) =>
+                // cov: skip — `net.recv` answers `None` on EOF, on an
+                // error and on a would-block alike (std.net's own doc),
+                // so `Some("")` is not a chunk shape this transport
+                // produces; the guard stays because without it a
+                // zero-length chunk would spin this loop forever
+                // without ever appending a byte.
+                if str.is_empty(chunk)
+                    going = false
+                else
+                    parts = list.push(parts, chunk)
+    str.join(parts, "")
+
+// The request line and headers, with the body's length in them.
+fn request_head(c: VsHttp, ep: VsEndpoint, method: Str, path: Str, body: Str) -> Str []
+    var lines: [Str] = []
+    lines = list.push(lines, "${method} ${ep.prefix}${path} HTTP/1.1")
+    lines = list.push(lines, "Host: ${ep.host}:${ep.port}")
+    lines = list.push(lines, "Content-Type: application/json")
+    lines = list.push(lines, "Content-Length: ${str.len(body)}")
+    lines = list.push(lines, "Connection: close")
+    list.append(lines, c.headers)
+    lines = list.push(lines, "")
+    lines = list.push(lines, "")
+    str.join(lines, "\r\n")
+
+struct VsReply
+    status: Int
+    body: Str
+
+// One exchange, both halves.
+fn request(c: VsHttp, method: Str, path: Str, body: Str) -> Result<VsReply, VsFault> [net]
+    let ep = endpoint_of(c.base_url, default_port(c.dialect))!
+    let conn = vs_connect(ep.host, ep.port, ep.secure)!
+    let head = request_head(c, ep, method, path, body)
+    // cov: skip — a write on a fresh loopback connection goes out; for
+    // `net.send` to answer `false` the peer must be gone before the
+    // write, which needs an RST (the net API has no linger and no
+    // shutdown), and on a blocking socket a full send buffer blocks
+    // instead of failing.  No test can pin this arm; the dial failure
+    // one line above is pinned for real.
+    if not conn_send(conn, head + body)
+        conn_close(conn)
+        return Err(VsTransportFailed("the request to ${ep.host}:${ep.port} was not sent"))
+    let raw = read_to_end(conn)
+    conn_close(conn)
+    split_reply(raw)
+
+// A reply as its status and its body.
+fn split_reply(raw: Str) -> Result<VsReply, VsFault> []
+    match str.index(raw, "\r\n\r\n")
+        None     => Err(VsMalformedReply("HTTP header terminator"))
+        Some(at) =>
+            let head = str.slice(raw, 0, at)
+            let body = str.slice(raw, at + 4, str.len(raw))
+            // `str.split_lines` answers one line even for an empty
+            // head, so the missing-line arm a match would need here is
+            // one no input can reach: an absent status line arrives as
+            // an empty one, and `status_of` refuses it the same way.
+            let line = list.first(str.split_lines(head)) ?? ""
+            match status_of(line)
+                None    => Err(VsMalformedReply("status code in ${line}"))
+                Some(n) => Ok(VsReply { status: n, body: content_length_of(head, body) })
+
+fn status_of(line: Str) -> ?Int []
+    let words = str.split(line, " ")
+    if list.len(words) < 2
+        return None
+    str.to_int(list.get(words, 1) ?? "")
+
+// The body cut to its own stated length.
+//
+// The socket is read to its end, so anything the server wrote after the
+// body — a second reply, a proxy's footer — would otherwise be handed
+// to the JSON parser as part of it.
+fn content_length_of(head: Str, body: Str) -> Str []
+    match header_value(head, "content-length")
+        None    => body
+        Some(t) =>
+            match str.to_int(str.trim(t))
+                None    => body
+                Some(n) =>
+                    if n >= 0 and n <= str.len(body)
+                        str.slice(body, 0, n)
+                    else
+                        body
+
+fn header_value(head: Str, name: Str) -> ?Str []
+    var found: ?Str = None
+    for line in str.split_lines(head)
+        match str.index(line, ":")
+            None     => ()
+            Some(at) =>
+                let key = str.lower(str.trim(str.slice(line, 0, at)))
+                if key == name
+                    found = Some(str.slice(line, at + 1, str.len(line)))
+    found
+
+// One exchange whose 2xx is the answer and whose anything else is a
+// fault.
+fn exchange(c: VsHttp, method: Str, path: Str, body: JsonValueH) -> Result<Str, VsFault> [net]
+    let r = request(c, method, path, json.stringify(body))!
+    if r.status >= 200 and r.status < 300
+        return Ok(r.body)
+    Err(decode_error(c.dialect, r.status, r.body))
+
+// The same, with the status kept: `ensure_collection` reads a 200 as
+// two different answers depending on what the body says.
+fn send_json(c: VsHttp, method: Str, path: Str, body: JsonValueH) -> Result<VsReply, VsFault> [net]
+    request(c, method, path, json.stringify(body))
+
+// The distance name qdrant knows the metric by.
+fn qdrant_distance(m: HnswMetric) -> Str []
+    match m
+        HnswCosine => "Cosine"
+        HnswL2     => "Euclid"
+        HnswInner  => "Dot"
+
+// The space name chroma knows it by.
+fn chroma_space(m: HnswMetric) -> Str []
+    match m
+        HnswCosine => "cosine"
+        HnswL2     => "l2"
+        HnswInner  => "ip"
+
+// The delete path and body, which differ by dialect and by nothing
+// else.
+fn delete_path(d: VsDialect, collection: Str) -> Str []
+    match d
+        VsQdrant => "/collections/${collection}/points/delete"
+        VsChroma => "/api/v1/collections/${collection}/delete"
+
+fn delete_body(d: VsDialect, docs: [VsDoc]) -> JsonValueH []
+    var ids: [Any] = []
+    list.append(ids, list.map(docs, doc => json.string(point_id(d, doc.id))))
+    match d
+        VsQdrant => json.object([("points", json.array(ids))])
+        VsChroma => json.object([("ids", json.array(ids))])
 
 // Page through every document in a remote collection.
 //
@@ -308,7 +1248,63 @@ pub fn check_query(d: VsDialect, q: VsQuery) -> Result<Int, VsFault> []
 //     vshttp.scroll(c, "", 256)
 // ```
 pub fn scroll(c: VsHttp, cursor: Str, limit: Int) -> Result<VsPage, VsFault> [net]
-    todo("vectorstore-nv.vshttp.scroll")
+    if limit <= 0
+        return Err(VsUnsupportedQuery("a page of ${limit} documents"))
+    match c.dialect
+        VsQdrant => qdrant_scroll(c, cursor, limit)
+        VsChroma => chroma_scroll(c, cursor, limit)
+
+// qdrant answers the cursor of the next page itself, and null at the
+// end.
+fn qdrant_scroll(c: VsHttp, cursor: Str, limit: Int) -> Result<VsPage, VsFault> [net]
+    var pairs: [Any] = []
+    pairs = list.push(pairs, ("limit", json.int(limit)))
+    pairs = list.push(pairs, ("with_payload", json.bool(true)))
+    pairs = list.push(pairs, ("with_vector", json.bool(true)))
+    if not str.is_empty(cursor)
+        pairs = list.push(pairs, ("offset", json.string(cursor)))
+    let reply = exchange(c, "POST", "/collections/${c.collection}/points/scroll",
+                         json.object(pairs))!
+    let doc = parse_body(reply, "JSON object")!
+    match json.get(doc, "result")
+        None        => Err(VsMalformedReply("scroll result"))
+        Some(inner) =>
+            match json.get_list(inner, "points")
+                None     => Err(VsMalformedReply("points list"))
+                Some(rs) =>
+                    var docs: [VsDoc] = []
+                    list.append(docs, list.map(rs, r => qdrant_doc(r)))
+                    Ok(VsPage { docs: docs, next: next_cursor(inner) })
+
+fn next_cursor(inner: JsonValueH) -> Str []
+    match json.get(inner, "next_page_offset")
+        None    => ""
+        Some(v) =>
+            if json.is_null(v)
+                ""
+            else
+                id_text(v)
+
+// chroma answers no cursor of its own: it pages by offset, so the
+// cursor this package hands back is a count, and a short page is the
+// end.
+fn chroma_scroll(c: VsHttp, cursor: Str, limit: Int) -> Result<VsPage, VsFault> [net]
+    let at = str.to_int(cursor) ?? 0
+    var pairs: [Any] = []
+    pairs = list.push(pairs, ("limit", json.int(limit)))
+    pairs = list.push(pairs, ("offset", json.int(at)))
+    var includes: [Any] = []
+    includes = list.push(includes, json.string("documents"))
+    includes = list.push(includes, json.string("metadatas"))
+    includes = list.push(includes, json.string("embeddings"))
+    pairs = list.push(pairs, ("include", json.array(includes)))
+    let reply = exchange(c, "POST", "/api/v1/collections/${c.collection}/get",
+                         json.object(pairs))!
+    let docs = chroma_docs(reply)!
+    if list.len(docs) < limit
+        Ok(VsPage { docs: docs, next: "" })
+    else
+        Ok(VsPage { docs: docs, next: str.from_int(at + list.len(docs)) })
 
 // One page of a scroll.
 pub struct VsPage
@@ -329,7 +1325,29 @@ pub struct VsPage
 //     vshttp.health(c)
 // ```
 pub fn health(c: VsHttp) -> Result<Bool, VsFault> [net]
-    todo("vectorstore-nv.vshttp.health")
+    match c.dialect
+        VsQdrant => qdrant_health(c)
+        VsChroma => chroma_health(c)
+
+// A 200 is the collection; a 404 is a server that is up and a
+// collection that is not there, which is an answer rather than a fault.
+fn qdrant_health(c: VsHttp) -> Result<Bool, VsFault> [net]
+    let r = request(c, "GET", "/collections/${c.collection}", "")!
+    if r.status == 200
+        Ok(true)
+    elif r.status == 404
+        Ok(false)
+    else
+        Err(decode_error(VsQdrant, r.status, r.body))
+
+fn chroma_health(c: VsHttp) -> Result<Bool, VsFault> [net]
+    let r = request(c, "GET", "/api/v1/collections/${c.collection}", "")!
+    if r.status == 200
+        Ok(true)
+    elif r.status == 404
+        Ok(false)
+    else
+        Err(decode_error(VsChroma, r.status, r.body))
 
 // Create the collection on the server if it is not there.
 //
@@ -344,7 +1362,52 @@ pub fn health(c: VsHttp) -> Result<Bool, VsFault> [net]
 //     vshttp.ensure_collection(c, cfg)
 // ```
 pub fn ensure_collection(c: VsHttp, config: VsConfig) -> Result<Bool, VsFault> [net]
-    todo("vectorstore-nv.vshttp.ensure_collection")
+    match c.dialect
+        VsQdrant => qdrant_ensure(c, config)
+        VsChroma => chroma_ensure(c, config)
+
+// The dimension and the metric are both the server's to fix at
+// creation: a qdrant collection built with the wrong distance answers
+// plausible nonsense, and one built with the wrong size refuses every
+// vector this package sends.
+fn qdrant_ensure(c: VsHttp, config: VsConfig) -> Result<Bool, VsFault> [net]
+    let body = json.object([
+        ("vectors", json.object([("size", json.int(config.dim)),
+                                 ("distance", json.string(qdrant_distance(config.metric)))])),
+        ("hnsw_config", json.object([("m", json.int(config.params.m)),
+                                     ("ef_construct", json.int(config.params.ef_construction))]))])
+    let r = send_json(c, "PUT", "/collections/${c.collection}", body)!
+    if r.status == 200
+        created_flag(r.body)
+    elif r.status == 409
+        Ok(false)
+    else
+        Err(decode_error(VsQdrant, r.status, r.body))
+
+// qdrant answers `{"result": true}` for a creation and
+// `{"result": false}` for one that found the collection already there.
+fn created_flag(body: Str) -> Result<Bool, VsFault> []
+    match json.parse(body)
+        None    => Ok(true)
+        Some(v) =>
+            match json.get_bool(v, "result")
+                None    => Ok(true)
+                Some(b) => Ok(b)
+
+// chroma takes the metric and not the dimension — its collections learn
+// the width from the first vector they are given, so a collection this
+// package creates is the width of the documents it is sent.
+fn chroma_ensure(c: VsHttp, config: VsConfig) -> Result<Bool, VsFault> [net]
+    let body = json.object([
+        ("name", json.string(c.collection)),
+        ("metadata", json.object([("hnsw:space", json.string(chroma_space(config.metric)))]))])
+    let r = send_json(c, "POST", "/api/v1/collections", body)!
+    if r.status == 200 or r.status == 201
+        Ok(true)
+    elif r.status == 409
+        Ok(false)
+    else
+        Err(decode_error(VsChroma, r.status, r.body))
 
 // A remote store performs `[net]`.
 //
@@ -362,17 +1425,87 @@ pub fn ensure_collection(c: VsHttp, config: VsConfig) -> Result<Bool, VsFault> [
 //     s.vs_search(q)
 // ```
 impl VsStore[net] for VsHttp
+    // Neither server answers how many points an upsert wrote, so the
+    // count is what was sent: a 2xx is the server saying it took them.
     fn vs_upsert(self, docs: [VsDoc]) -> Result<Int, VsFault> [net]
-        todo("vectorstore-nv.vshttp.VsHttp.vs_upsert")
+        let body = encode_upsert(self, docs)!
+        let _ = exchange(self, "POST", upsert_path(self), body)!
+        Ok(list.len(docs))
 
+    // A delete reports how many were there to delete, which takes a
+    // read: "I deleted three" and "I deleted three hundred that were
+    // never there" are different facts about a collection.
     fn vs_delete(self, ids: [Str]) -> Result<Int, VsFault> [net]
-        todo("vectorstore-nv.vshttp.VsHttp.vs_delete")
+        let found = self.vs_get(ids)!
+        if list.len(found) == 0
+            return Ok(0)
+        let body = delete_body(self.dialect, found)
+        let _ = exchange(self, "POST", delete_path(self.dialect, self.collection), body)!
+        Ok(list.len(found))
 
     fn vs_get(self, ids: [Str]) -> Result<[VsDoc], VsFault> [net]
-        todo("vectorstore-nv.vshttp.VsHttp.vs_get")
+        match self.dialect
+            VsQdrant => qdrant_get(self, ids)
+            VsChroma => chroma_get(self, ids)
 
     fn vs_search(self, q: VsQuery) -> Result<VsSearchOutcome, VsFault> [net]
-        todo("vectorstore-nv.vshttp.VsHttp.vs_search")
+        let body = encode_search(self, q)!
+        let reply = exchange(self, "POST", search_path(self), body)!
+        decode_search(self, reply)
 
     fn vs_count(self) -> Result<Int, VsFault> [net]
-        todo("vectorstore-nv.vshttp.VsHttp.vs_count")
+        match self.dialect
+            VsQdrant => qdrant_count(self)
+            VsChroma => chroma_count(self)
+
+// qdrant's get answers the points in its own order and this store
+// answers them in the asked order, which is what `vsdoc.get_many` does
+// locally.
+fn qdrant_get(c: VsHttp, ids: [Str]) -> Result<[VsDoc], VsFault> [net]
+    var point_ids: [Any] = []
+    list.append(point_ids, list.map(ids, id => json.string(point_id(VsQdrant, id))))
+    let body = json.object([("ids", json.array(point_ids)),
+                            ("with_payload", json.bool(true)),
+                            ("with_vector", json.bool(true))])
+    let reply = exchange(c, "POST", "/collections/${c.collection}/points", body)!
+    let docs = qdrant_docs(reply)!
+    Ok(in_order(docs, ids))
+
+fn chroma_get(c: VsHttp, ids: [Str]) -> Result<[VsDoc], VsFault> [net]
+    var id_list: [Any] = []
+    list.append(id_list, list.map(ids, id => json.string(point_id(VsChroma, id))))
+    var includes: [Any] = []
+    includes = list.push(includes, json.string("documents"))
+    includes = list.push(includes, json.string("metadatas"))
+    includes = list.push(includes, json.string("embeddings"))
+    let body = json.object([("ids", json.array(id_list)), ("include", json.array(includes))])
+    let reply = exchange(c, "POST", "/api/v1/collections/${c.collection}/get", body)!
+    let docs = chroma_docs(reply)!
+    Ok(in_order(docs, ids))
+
+// An exact count, not qdrant's estimate: a store's `vs_count` is the
+// number a caller compares against what it inserted.
+fn qdrant_count(c: VsHttp) -> Result<Int, VsFault> [net]
+    let body = json.object([("exact", json.bool(true))])
+    let reply = exchange(c, "POST", "/collections/${c.collection}/points/count", body)!
+    let doc = parse_body(reply, "JSON object")!
+    match json.get(doc, "result")
+        None    => Err(VsMalformedReply("count result"))
+        Some(r) =>
+            match json.get_int(r, "count")
+                None    => Err(VsMalformedReply("count in the result"))
+                Some(n) => Ok(n)
+
+// chroma answers the number by itself, and answers it as JSON.
+fn chroma_count(c: VsHttp) -> Result<Int, VsFault> [net]
+    let reply = exchange(c, "GET", "/api/v1/collections/${c.collection}/count",
+                         json.object([]))!
+    match str.to_int(str.trim(reply))
+        Some(n) => Ok(n)
+        None    => count_in_json(reply)
+
+fn count_in_json(reply: Str) -> Result<Int, VsFault> []
+    let doc = parse_body(reply, "JSON object")!
+    match json.get_int(doc, "count")
+        None    => Err(VsMalformedReply("count"))
+        Some(n) => Ok(n)
