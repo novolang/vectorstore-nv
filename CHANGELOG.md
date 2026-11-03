@@ -5,7 +5,7 @@ All notable changes to vectorstore-nv are recorded here. The format is
 package follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
 with the pre-1.0 rule that a breaking change bumps the MINOR number.
 
-## Unreleased
+## 0.1.0 — 2026-11-03
 
 ### Changed
 
@@ -14,6 +14,8 @@ with the pre-1.0 rule that a breaking change bumps the MINOR number.
 ### Known follow-ups
 
 - The `VsStore` mutators (`vs_upsert`, `vs_delete`) take `self` by value and write through a `var shared = self` alias in `VsMemory` and `VsFileStore`.  Declaring them `var self` would remove the aliases, but it is a breaking change: a caller holding a `let`-bound store could no longer call them (E2036), so it waits for the next breaking release and is not made in a patch.
+
+This release requires novo 0.23.0 or later.
 
 ## 0.1.0 — 2026-10-11
 
@@ -198,6 +200,10 @@ one version number.
   instead: the transport lines by the loopback server above, and the
   malformed-reply and nothing-to-delete arms by served bodies of
   exactly those shapes.
+
+## 0.0.4 — 2026-10-25
+
+A file that names a sibling module's type, function or constant now has the `use` line for that module (E2033, E2003).  No signature and no behaviour changed.
 
 ## 0.0.3 — 2026-09-28
 
